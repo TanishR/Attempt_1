@@ -1,0 +1,12 @@
+pandas
+pyarrow
+numpy
+tqdm
+scikit-learn
+rapidfuzz
+lightgbm
+anyascii
+torch
+transformers>=4.51
+sentence-transformers>=3.0
+psutil

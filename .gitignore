@@ -1,8 +1,10 @@
 dataset/
 cache/
 output/
+submissions/
 __pycache__/
 *.npy
 *.parquet
+*.zip
 .DS_Store
-
+amlc_env/
