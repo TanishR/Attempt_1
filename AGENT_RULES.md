@@ -1,0 +1,13 @@
+RULES
+- GUIDEBOOK.md is the source of truth. Follow its steps, libraries, parameters and file names.
+- Do only the step I ask for. Never start the next step on your own.
+- If the guidebook is ambiguous, or the data contradicts it, STOP and ask me. Do not improvise.
+- Any deviation from the guidebook (different library, parameter, algorithm, file name) must be listed under "Deviations" in the STEP REPORT with the reason.
+- Never use: external APIs, web requests, geocoding, or internet data at runtime. Only the provided TSV files. (pip install and the Hugging Face model download during setup are allowed.)
+- Never hardcode countries. Treat country as an open set of strings. Never use country as a model feature.
+- Never use FAISS, class_weight/is_unbalance, or a single global threshold unless I approve it.
+- Every script must work with SAMPLE=50000 (laptop) and SAMPLE=None (EC2 full run) via config.py.
+- Every stage reads inputs from and writes outputs to cache/ (parquet or npy), so any stage can be rerun alone.
+- Every function has a 1-2 line comment: what it takes, what it returns.
+- Avoid row-wise Python loops on large data. Use vectorized pandas/numpy, rapidfuzz process.cpdist, and chunking.
+- After running code, report real numbers from the run. Never invent or estimate results.
