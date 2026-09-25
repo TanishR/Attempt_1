@@ -24,6 +24,7 @@ def get_args():
     parser.add_argument("--cache-dir", type=str, default=None, help="Directory holding cached parquet and npy files.")
     parser.add_argument("--laptop-test", action="store_true", help="Run on cache/laptop_test isolated small dataset.")
     parser.add_argument("--chunk-size", type=int, default=100000, help="S1 query chunk size for memory-safe processing.")
+    parser.add_argument("--k-channel-a", type=int, default=50, help="Number of nearest neighbors to retrieve per source in Channel A.")
     return parser.parse_args()
 
 def load_embedding_arrays(cache_dir, split, source):
@@ -266,6 +267,101 @@ def search_channel_a_gpu(
     df_res = pd.DataFrame(results, columns=['s1_id', 'cand_id', 'emb_score', 'emb_rank', 'ch_emb'])
     return df_res
 
+def search_channel_d_reverse_gpu(
+    s1_keys_df, c_keys_df, s1_main_emb, s1_main_map, s1_main_ids, s1_alt_emb, s1_alt_map, s1_alt_ids,
+    c_main_emb, c_main_map, c_alt_emb, c_alt_map, topk, device, src_code
+):
+    """
+    Channel D (reverse search): for each S2/S3 record, finds top-k S1 entities within country using main+alt embeddings.
+    Returns: pandas.DataFrame with columns ['s1_id', 'cand_id', 'cand_source', 'emb_score', 'ch_rev'].
+    """
+    rev_results = []
+    countries = s1_keys_df['country'].dropna().unique() if BLOCK_BY_COUNTRY else ["ALL"]
+    
+    for country in countries:
+        if BLOCK_BY_COUNTRY:
+            s1_sub = s1_keys_df[s1_keys_df['country'] == country]
+            c_sub = c_keys_df[c_keys_df['country'] == country]
+        else:
+            s1_sub = s1_keys_df
+            c_sub = c_keys_df
+            
+        s1_c_ids = s1_sub['entity_id'].values
+        cand_c_ids = c_sub['entity_id'].values
+        
+        if len(s1_c_ids) == 0 or len(cand_c_ids) == 0:
+            continue
+            
+        # Build S1 index: main + alt stacked
+        s1_m_idx = [s1_main_map[sid] for sid in s1_c_ids if sid in s1_main_map]
+        X_main = s1_main_emb[s1_m_idx]
+        X_main_ids = s1_c_ids[[sid in s1_main_map for sid in s1_c_ids]]
+        
+        s1_a_sids = [sid for sid in s1_c_ids if sid in s1_alt_map]
+        if s1_a_sids:
+            s1_a_idx = [s1_alt_map[sid] for sid in s1_a_sids]
+            X_alt = s1_alt_emb[s1_a_idx]
+            X_alt_ids = np.array(s1_a_sids, dtype=object)
+            X_stacked = np.vstack([X_main, X_alt])
+            row_to_sid = np.concatenate([X_main_ids, X_alt_ids])
+        else:
+            X_stacked = X_main
+            row_to_sid = X_main_ids
+            
+        N_index = len(X_stacked)
+        if N_index == 0:
+            continue
+            
+        X_gpu = torch.from_numpy(X_stacked).to(device)
+        
+        # Calculate query chunk size
+        max_bytes = 4 * 1024 * 1024 * 1024
+        bytes_per_query = N_index * 2
+        max_q_chunk = max(1, max_bytes // max(1, bytes_per_query))
+        q_chunk_size = min(20000, max_q_chunk)
+        k_search = min(2 * topk, N_index)
+        
+        for q_start in range(0, len(cand_c_ids), q_chunk_size):
+            q_end = min(q_start + q_chunk_size, len(cand_c_ids))
+            sub_q_cids = cand_c_ids[q_start:q_end]
+            
+            sub_m_idx = [c_main_map[cid] for cid in sub_q_cids]
+            Q_m = torch.from_numpy(c_main_emb[sub_m_idx]).to(device)
+            S = Q_m @ X_gpu.T
+            
+            has_alt = np.array([cid in c_alt_map for cid in sub_q_cids])
+            if has_alt.any():
+                sub_a_cids = [cid for cid in sub_q_cids if cid in c_alt_map]
+                sub_a_idx = [c_alt_map[cid] for cid in sub_a_cids]
+                Q_a = torch.from_numpy(c_alt_emb[sub_a_idx]).to(device)
+                S_a = Q_a @ X_gpu.T
+                S[has_alt] = torch.maximum(S[has_alt], S_a)
+                
+            top_scores, top_indices = torch.topk(S, k=k_search, dim=1)
+            top_scores = top_scores.float().cpu().numpy()
+            top_indices = top_indices.cpu().numpy()
+            
+            for b, cid in enumerate(sub_q_cids):
+                b_scores = top_scores[b]
+                b_sids = row_to_sid[top_indices[b]]
+                seen = {}
+                for sid, score in zip(b_sids, b_scores):
+                    if sid not in seen or score > seen[sid]:
+                        seen[sid] = score
+                        if len(seen) >= topk:
+                            break
+                for sid, score in seen.items():
+                    rev_results.append((sid, cid, float(score), src_code, 1))
+                    
+        del X_gpu
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+            
+    df_rev = pd.DataFrame(rev_results, columns=['s1_id', 'cand_id', 'emb_score', 'cand_source', 'ch_rev'])
+    return df_rev
+
 def compute_missing_scores_vectorized(
     df_missing, s1_main_emb, s1_main_map, s1_alt_emb, s1_alt_map,
     c_main_emb, c_main_map, c_alt_emb, c_alt_map
@@ -312,7 +408,7 @@ def compute_missing_scores_vectorized(
         
     return scores
 
-def run_recall_report(df_cands, gt, norm_s1, norm_s2, norm_s3):
+def run_recall_report(df_cands, gt, norm_s1, norm_s2, norm_s3, cand_cap=CAND_CAP):
     """
     Computes and prints comprehensive recall analytics, channel contributions, and side-by-side missed pairs.
     """
@@ -320,16 +416,21 @@ def run_recall_report(df_cands, gt, norm_s1, norm_s2, norm_s3):
     print("               STEP 5 CANDIDATE GENERATION RECALL REPORT")
     print("="*70)
     
-    s1_in_cands = set(df_cands['s1_id'].unique())
+    # Evaluate primary metrics at configured CAND_CAP
+    is_sym = (df_cands['ch_addr'] == 1) | (df_cands['ch_skel'] == 1) | (df_cands.get('ch_rare', 0) == 1)
+    df_sorted = df_cands.assign(is_sym=is_sym).sort_values(['s1_id', 'is_sym', 'emb_score'], ascending=[True, False, False])
+    df_eval_cands = df_sorted.groupby('s1_id').head(cand_cap).reset_index(drop=True)
+    
+    s1_in_cands = set(df_eval_cands['s1_id'].unique())
     gt_eval = gt[gt['s1_id'].isin(s1_in_cands)].copy()
     total_gt_pairs = len(gt_eval)
     
     # 1. Pair recall overall
-    cands_set = set(zip(df_cands['s1_id'], df_cands['cand_id']))
+    cands_set = set(zip(df_eval_cands['s1_id'], df_eval_cands['cand_id']))
     gt_eval['found'] = [pair in cands_set for pair in zip(gt_eval['s1_id'], gt_eval['match_id'])]
     found_gt_pairs = gt_eval['found'].sum()
     overall_recall = (found_gt_pairs / max(1, total_gt_pairs)) * 100
-    print(f"\n1. Overall Pair Recall: {found_gt_pairs} / {total_gt_pairs} ({overall_recall:.2f}%)")
+    print(f"\n1. Overall Pair Recall (CAND_CAP={cand_cap}): {found_gt_pairs} / {total_gt_pairs} ({overall_recall:.2f}%)")
     
     # Pair recall by source
     for src in ['S2', 'S3']:
@@ -351,7 +452,7 @@ def run_recall_report(df_cands, gt, norm_s1, norm_s2, norm_s3):
         
     # 2. Entity-level recall
     gt_grouped = gt_eval.groupby('s1_id')['match_id'].apply(set)
-    cands_grouped = df_cands.groupby('s1_id')['cand_id'].apply(set).to_dict()
+    cands_grouped = df_eval_cands.groupby('s1_id')['cand_id'].apply(set).to_dict()
     
     fully_found_entities = 0
     for sid, gold_set in gt_grouped.items():
@@ -361,14 +462,14 @@ def run_recall_report(df_cands, gt, norm_s1, norm_s2, norm_s3):
             
     total_entities = len(gt_grouped)
     entity_recall = (fully_found_entities / max(1, total_entities)) * 100
-    print(f"\n2. Entity-Level Recall (100% matches in candidates): {fully_found_entities} / {total_entities} ({entity_recall:.2f}%)")
+    print(f"\n2. Entity-Level Recall (100% matches in candidates at CAND_CAP={cand_cap}): {fully_found_entities} / {total_entities} ({entity_recall:.2f}%)")
     
     # 3. Candidates per S1 statistics
-    cands_per_s1 = df_cands.groupby('s1_id').size()
+    cands_per_s1 = df_eval_cands.groupby('s1_id').size()
     avg_cands = cands_per_s1.mean()
     p95_cands = cands_per_s1.quantile(0.95)
     max_cands = cands_per_s1.max()
-    print(f"\n3. Candidate Count Statistics:")
+    print(f"\n3. Candidate Count Statistics (at CAND_CAP={cand_cap}):")
     print(f"   - Mean candidates per S1: {avg_cands:.2f}")
     print(f"   - 95th percentile candidates per S1: {p95_cands:.1f}")
     print(f"   - Max candidates per S1: {max_cands}")
@@ -376,31 +477,43 @@ def run_recall_report(df_cands, gt, norm_s1, norm_s2, norm_s3):
     # 4. Unique contribution per channel
     # Merge candidates with GT to inspect channel tags of found GT pairs
     gt_pairs_df = gt_eval[gt_eval['found']][['s1_id', 'match_id']].rename(columns={'match_id': 'cand_id'})
-    found_cands = df_cands.merge(gt_pairs_df, on=['s1_id', 'cand_id'], how='inner')
+    found_cands = df_eval_cands.merge(gt_pairs_df, on=['s1_id', 'cand_id'], how='inner')
     
-    only_emb = len(found_cands[(found_cands['ch_emb'] == 1) & (found_cands['ch_addr'] == 0) & (found_cands['ch_skel'] == 0) & (found_cands.get('ch_rare', 0) == 0)])
-    only_addr = len(found_cands[(found_cands['ch_emb'] == 0) & (found_cands['ch_addr'] == 1) & (found_cands['ch_skel'] == 0) & (found_cands.get('ch_rare', 0) == 0)])
-    only_skel = len(found_cands[(found_cands['ch_emb'] == 0) & (found_cands['ch_addr'] == 0) & (found_cands['ch_skel'] == 1) & (found_cands.get('ch_rare', 0) == 0)])
-    only_rare = len(found_cands[(found_cands['ch_emb'] == 0) & (found_cands['ch_addr'] == 0) & (found_cands['ch_skel'] == 0) & (found_cands.get('ch_rare', 0) == 1)])
+    only_emb = len(found_cands[(found_cands['ch_emb'] == 1) & (found_cands['ch_addr'] == 0) & (found_cands['ch_skel'] == 0) & (found_cands.get('ch_rare', 0) == 0) & (found_cands.get('ch_rev', 0) == 0)])
+    only_addr = len(found_cands[(found_cands['ch_emb'] == 0) & (found_cands['ch_addr'] == 1) & (found_cands['ch_skel'] == 0) & (found_cands.get('ch_rare', 0) == 0) & (found_cands.get('ch_rev', 0) == 0)])
+    only_skel = len(found_cands[(found_cands['ch_emb'] == 0) & (found_cands['ch_addr'] == 0) & (found_cands['ch_skel'] == 1) & (found_cands.get('ch_rare', 0) == 0) & (found_cands.get('ch_rev', 0) == 0)])
+    only_rare = len(found_cands[(found_cands['ch_emb'] == 0) & (found_cands['ch_addr'] == 0) & (found_cands['ch_skel'] == 0) & (found_cands.get('ch_rare', 0) == 1) & (found_cands.get('ch_rev', 0) == 0)])
+    only_rev = len(found_cands[(found_cands['ch_emb'] == 0) & (found_cands['ch_addr'] == 0) & (found_cands['ch_skel'] == 0) & (found_cands.get('ch_rare', 0) == 0) & (found_cands.get('ch_rev', 0) == 1)])
     
     print(f"\n4. Unique Channel Contributions on Recovered GT Pairs:")
     print(f"   - Unique to Channel A (Embedding): {only_emb} ({only_emb/max(1, found_gt_pairs)*100:.2f}%)")
     print(f"   - Unique to Channel B (Address):   {only_addr} ({only_addr/max(1, found_gt_pairs)*100:.2f}%)")
     print(f"   - Unique to Channel C (Skeleton):  {only_skel} ({only_skel/max(1, found_gt_pairs)*100:.2f}%)")
     print(f"   - Unique to Channel E (Rare Addr): {only_rare} ({only_rare/max(1, found_gt_pairs)*100:.2f}%)")
+    print(f"   - Unique to Channel D (Reverse):   {only_rev} ({only_rev/max(1, found_gt_pairs)*100:.2f}%)")
     
     # 5. Channel A Recall@k curve
     print(f"\n5. Channel A (Embedding) Recall@k Curve:")
     ch_a_cands = df_cands[df_cands['ch_emb'] == 1]
-    for k in [5, 10, 15, 20]:
+    for k in [5, 10, 15, 20, 30, 50]:
         ch_a_k = ch_a_cands[ch_a_cands['emb_rank'] <= k]
         pairs_k = set(zip(ch_a_k['s1_id'], ch_a_k['cand_id']))
         f_k = sum(pair in pairs_k for pair in zip(gt_eval['s1_id'], gt_eval['match_id']))
         print(f"   - Channel A Recall@{k}: {f_k} / {total_gt_pairs} ({(f_k / max(1, total_gt_pairs))*100:.2f}%)")
         
-    # 6. Sample of 20 missed pairs side by side
+    # 6. Multi-CAND_CAP recall evaluation
+    print(f"\n6. Recall Across Multiple Candidate Caps (CAND_CAP = 30, 40, 50):")
+    is_sym = (df_cands['ch_addr'] == 1) | (df_cands['ch_skel'] == 1) | (df_cands.get('ch_rare', 0) == 1)
+    df_sorted = df_cands.assign(is_sym=is_sym).sort_values(['s1_id', 'is_sym', 'emb_score'], ascending=[True, False, False])
+    for cap in [30, 40, 50]:
+        df_cap = df_sorted.groupby('s1_id').head(cap)
+        pairs_cap = set(zip(df_cap['s1_id'], df_cap['cand_id']))
+        f_cap = sum(pair in pairs_cap for pair in zip(gt_eval['s1_id'], gt_eval['match_id']))
+        print(f"   - Recall @ CAND_CAP={cap}: {f_cap} / {total_gt_pairs} ({(f_cap / max(1, total_gt_pairs))*100:.2f}%)")
+        
+    # 7. Sample of 20 missed pairs side by side
     missed_gt = gt_eval[~gt_eval['found']]
-    print(f"\n6. Side-by-Side Sample of Missed Pairs (Total Missed: {len(missed_gt)}):")
+    print(f"\n7. Side-by-Side Sample of Missed Pairs (Total Missed: {len(missed_gt)}):")
     print("-" * 100)
     
     # Prepare text lookups
@@ -470,6 +583,23 @@ def main():
     c2_e_keys = build_channel_e_keys(c2_keys_df, df_tokens)
     c3_e_keys = build_channel_e_keys(c3_keys_df, df_tokens)
 
+    # Channel D (Reverse Search): compute top-3 S1 per S2 and S3 record within country
+    print("Running Channel D (Reverse Embedding Search: top-3 S1 per S2/S3 record)...")
+    rev_cands_s2 = search_channel_d_reverse_gpu(
+        s1_keys_df, c2_keys_df, s1_m_emb, s1_m_map, s1_m_ids, s1_a_emb, s1_a_map, s1_a_ids,
+        c2_m_emb, c2_m_map, c2_a_emb, c2_a_map, 3, device, 0
+    )
+    rev_cands_s3 = search_channel_d_reverse_gpu(
+        s1_keys_df, c3_keys_df, s1_m_emb, s1_m_map, s1_m_ids, s1_a_emb, s1_a_map, s1_a_ids,
+        c3_m_emb, c3_m_map, c3_a_emb, c3_a_map, 3, device, 1
+    )
+    all_rev_cands = pd.concat([rev_cands_s2, rev_cands_s3], ignore_index=True)
+    all_rev_cands['emb_rank'] = 999
+    all_rev_cands['ch_emb'] = 0
+    all_rev_cands['ch_addr'] = 0
+    all_rev_cands['ch_skel'] = 0
+    all_rev_cands['ch_rare'] = 0
+
     # Load GT for label assignment if train/val split
     gt_df = None
     if args.split == "train":
@@ -530,7 +660,7 @@ def main():
                 df_a = search_channel_a_gpu(
                     s1_c_ids, s1_m_emb, s1_m_map, s1_a_emb, s1_a_map,
                     cand_c_ids, c_m_emb, c_m_map, c_a_emb, c_a_map,
-                    K_PER_SOURCE, device
+                    args.k_channel_a, device
                 )
                 
                 # --- Channel B: Address Hash Join (v2) ---
@@ -578,7 +708,7 @@ def main():
                 else:
                     df_e = pd.DataFrame(columns=['s1_id', 'cand_id', 'ch_rare'])
 
-                # --- Union Channels ---
+                # --- Union Channels A, B, C, E ---
                 merged_cands = pd.concat([df_a, df_b, df_c, df_e], ignore_index=True)
                 if merged_cands.empty:
                     continue
@@ -604,13 +734,26 @@ def main():
                 merged_cands['cand_source'] = src_code
                 chunk_cands_list.append(merged_cands)
                 
+        # Append Channel D reverse candidates for S1 in this chunk
+        df_d_chunk = all_rev_cands[all_rev_cands['s1_id'].isin(c_s1_ids)].copy()
+        if not df_d_chunk.empty:
+            chunk_cands_list.append(df_d_chunk)
+            
         if not chunk_cands_list:
-            chunk_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank', 'ch_emb', 'ch_addr', 'ch_skel', 'ch_rare'])
+            chunk_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank', 'ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev'])
         else:
             chunk_df = pd.concat(chunk_cands_list, ignore_index=True)
-            # Cap candidates per S1 to CAND_CAP (top by emb_score)
-            chunk_df = chunk_df.sort_values(['s1_id', 'emb_score'], ascending=[True, False])
-            chunk_df = chunk_df.groupby('s1_id').head(CAND_CAP).reset_index(drop=True)
+            agg_chunk = {
+                'ch_emb': 'max', 'ch_addr': 'max', 'ch_skel': 'max', 'ch_rare': 'max', 'ch_rev': 'max',
+                'emb_score': 'max', 'emb_rank': 'min', 'cand_source': 'first'
+            }
+            chunk_df = chunk_df.groupby(['s1_id', 'cand_id']).agg(agg_chunk).reset_index()
+            chunk_df[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev']] = chunk_df[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev']].fillna(0).astype(int)
+            
+            # Cap candidates per S1 to max(50, CAND_CAP), prioritizing symbolic address blocks
+            is_sym = (chunk_df['ch_addr'] == 1) | (chunk_df['ch_skel'] == 1) | (chunk_df['ch_rare'] == 1)
+            chunk_df = chunk_df.assign(is_sym=is_sym).sort_values(['s1_id', 'is_sym', 'emb_score'], ascending=[True, False, False]).drop(columns=['is_sym'])
+            chunk_df = chunk_df.groupby('s1_id').head(max(50, CAND_CAP)).reset_index(drop=True)
             
         # Add label column if ground truth exists
         if gt_df is not None:
@@ -629,7 +772,7 @@ def main():
     if all_chunks_df:
         final_df = pd.concat(all_chunks_df, ignore_index=True)
     else:
-        final_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank', 'ch_emb', 'ch_addr', 'ch_skel', 'ch_rare'])
+        final_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank', 'ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev'])
         
     final_df.to_parquet(final_cands_path, index=False)
     elapsed_total = time.time() - start_total_time
@@ -641,7 +784,14 @@ def main():
         norm_s1 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source1.parquet"))
         norm_s2 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source2.parquet"))
         norm_s3 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source3.parquet"))
-        run_recall_report(final_df, gt_df, norm_s1, norm_s2, norm_s3)
+        run_recall_report(final_df, gt_df, norm_s1, norm_s2, norm_s3, cand_cap=CAND_CAP)
+        
+        if CAND_CAP < 50:
+            is_sym = (final_df['ch_addr'] == 1) | (final_df['ch_skel'] == 1) | (final_df.get('ch_rare', 0) == 1)
+            final_df = final_df.assign(is_sym=is_sym).sort_values(['s1_id', 'is_sym', 'emb_score'], ascending=[True, False, False]).drop(columns=['is_sym'])
+            final_df = final_df.groupby('s1_id').head(CAND_CAP).reset_index(drop=True)
+            final_df.to_parquet(final_cands_path, index=False)
+            print(f"\nTruncated final candidates file to CAND_CAP={CAND_CAP}: {len(final_df)} candidate pairs saved to {final_cands_path}")
 
 if __name__ == "__main__":
     main()
