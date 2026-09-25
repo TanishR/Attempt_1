@@ -22,6 +22,21 @@ from joblib import Parallel, delayed
 import config
 from decide import apply_exclusivity, decide
 from metrics import build_gold_map, f05_entity, macro_f05
+from s4_features import _id_to_int
+from s7_predict import _int_to_id
+
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
+
+def _rss_mb() -> float:
+    """Returns current process RSS in MB, or -1.0 if psutil is unavailable."""
+    if _HAS_PSUTIL:
+        return psutil.Process(os.getpid()).memory_info().rss / 1_048_576
+    return -1.0
 
 
 def parse_args():
@@ -40,7 +55,9 @@ def load_val_probabilities(cache_dir: str, version: str) -> pd.DataFrame:
     """
     Loads validation and competitor prediction probabilities from cache.
     Merges emb_score from feature files if not already present.
-    Returns: DataFrame containing s1_id, cand_id, prob, is_competitor, and emb_score.
+    Converts s1_id and cand_id to int64 via _id_to_int and keeps only needed columns
+    with compact dtypes (int64/float32/int8).
+    Returns: DataFrame containing s1_id (int64), cand_id (int64), prob (float32), is_competitor (int8), and optional emb_score (float32).
     """
     probs_path = os.path.join(cache_dir, f"val_probs_{version}.parquet")
     if not os.path.exists(probs_path):
@@ -48,6 +65,12 @@ def load_val_probabilities(cache_dir: str, version: str) -> pd.DataFrame:
 
     probs_df = pd.read_parquet(probs_path)
     print(f"Loaded {len(probs_df):,} probability rows from {probs_path}")
+
+    # Convert IDs to int64 before exclusivity
+    if probs_df["s1_id"].dtype == object or isinstance(probs_df["s1_id"].iloc[0], str):
+        probs_df["s1_id"] = _id_to_int(probs_df["s1_id"], validate=True)
+    if probs_df["cand_id"].dtype == object or isinstance(probs_df["cand_id"].iloc[0], str):
+        probs_df["cand_id"] = _id_to_int(probs_df["cand_id"], validate=True)
 
     # Merge emb_score if not present for tie-breaking
     if "emb_score" not in probs_df.columns:
@@ -62,17 +85,49 @@ def load_val_probabilities(cache_dir: str, version: str) -> pd.DataFrame:
 
         if feat_files:
             print("Merging emb_score from feature files for exact tie-breaking...")
-            emb_dfs = [pd.read_parquet(fp, columns=["s1_id", "cand_id", "emb_score"]) for fp in feat_files]
-            all_emb_df = pd.concat(emb_dfs, ignore_index=True).drop_duplicates(subset=["s1_id", "cand_id"])
-            probs_df = probs_df.merge(all_emb_df, on=["s1_id", "cand_id"], how="left")
+            val_s1_set = set(probs_df["s1_id"].unique())
+            emb_chunks = []
+            for fp in feat_files:
+                cdf = pd.read_parquet(fp, columns=["s1_id", "cand_id", "emb_score"])
+                # Convert IDs to int64
+                if cdf["s1_id"].dtype == object or isinstance(cdf["s1_id"].iloc[0], str):
+                    cdf["s1_id"] = _id_to_int(cdf["s1_id"], validate=False)
+                # Keep only val/competitor S1 rows to avoid keeping train rows in memory
+                cdf = cdf[cdf["s1_id"].isin(val_s1_set)]
+                if len(cdf) > 0:
+                    if cdf["cand_id"].dtype == object or isinstance(cdf["cand_id"].iloc[0], str):
+                        cdf["cand_id"] = _id_to_int(cdf["cand_id"], validate=False)
+                    cdf["emb_score"] = cdf["emb_score"].astype(np.float32)
+                    emb_chunks.append(cdf)
+            if emb_chunks:
+                all_emb_df = pd.concat(emb_chunks, ignore_index=True).drop_duplicates(subset=["s1_id", "cand_id"])
+                probs_df = probs_df.merge(all_emb_df, on=["s1_id", "cand_id"], how="left")
 
+    # Keep only needed columns with minimal dtypes (int64, float32, int8)
+    probs_df["s1_id"] = probs_df["s1_id"].astype(np.int64)
+    probs_df["cand_id"] = probs_df["cand_id"].astype(np.int64)
+    probs_df["prob"] = probs_df["prob"].astype(np.float32)
+    if "is_competitor" in probs_df.columns:
+        probs_df["is_competitor"] = probs_df["is_competitor"].astype(np.int8)
+    else:
+        probs_df["is_competitor"] = np.int8(0)
+    if "emb_score" in probs_df.columns:
+        probs_df["emb_score"] = probs_df["emb_score"].astype(np.float32)
+
+    keep_cols = ["s1_id", "cand_id", "prob", "is_competitor"]
+    if "emb_score" in probs_df.columns:
+        keep_cols.append("emb_score")
+    probs_df = probs_df[keep_cols].copy()
+
+    mem_mb = probs_df.memory_usage(deep=True).sum() / 1_048_576
+    print(f"probs_df prepared: {len(probs_df):,} rows, {len(keep_cols)} cols ({probs_df.dtypes.to_dict()}) | Memory: {mem_mb:.1f} MB")
     return probs_df
 
 
-def precompute_s1_candidates(df_excl: pd.DataFrame) -> Dict[str, Tuple[str, float, np.ndarray, np.ndarray]]:
+def precompute_s1_candidates(df_excl: pd.DataFrame) -> Dict[int, Tuple[int, float, np.ndarray, np.ndarray]]:
     """
     Precomputes sorted candidates and probabilities per S1 for ultra-fast threshold sweeps.
-    Returns: dict mapping s1_id -> (top1_cand, top1_prob, extra_cands_array, extra_probs_array).
+    Returns: dict mapping s1_id (int) -> (top1_cand, top1_prob, extra_cands_array, extra_probs_array).
     """
     if len(df_excl) == 0:
         return {}
@@ -86,15 +141,20 @@ def precompute_s1_candidates(df_excl: pd.DataFrame) -> Dict[str, Tuple[str, floa
 
     df_sorted = df_excl.sort_values(by=sort_cols, ascending=asc)
 
-    s1_data: Dict[str, Tuple[str, float, np.ndarray, np.ndarray]] = {}
-    for s1_id, grp in df_sorted.groupby("s1_id"):
-        cands = grp["cand_id"].values
-        probs = grp["prob"].values.astype(np.float32)
-        top1_c = cands[0]
-        top1_p = float(probs[0])
-        extra_c = cands[1:]
-        extra_p = probs[1:]
-        s1_data[s1_id] = (top1_c, top1_p, extra_c, extra_p)
+    s1_ids = df_sorted["s1_id"].values
+    cand_ids = df_sorted["cand_id"].values
+    probs = df_sorted["prob"].values.astype(np.float32)
+
+    # Vectorized contiguous boundary detection on sorted s1_ids
+    change_idx = np.flatnonzero(s1_ids[1:] != s1_ids[:-1]) + 1
+    splits = np.concatenate(([0], change_idx, [len(s1_ids)]))
+
+    s1_data: Dict[int, Tuple[int, float, np.ndarray, np.ndarray]] = {}
+    for i in range(len(splits) - 1):
+        start = splits[i]
+        end = splits[i + 1]
+        s1 = s1_ids[start]
+        s1_data[s1] = (cand_ids[start], float(probs[start]), cand_ids[start + 1:end], probs[start + 1:end])
 
     return s1_data
 
@@ -177,6 +237,8 @@ def run_grid_search(
     for ue, m in excl_states:
         # Exclusivity uses val S1 + competitor S1 (is_competitor=1)
         df_excl = apply_exclusivity(probs_df, margin=m, use_exclusivity=ue)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] After exclusivity (ue={ue}, m={m:.2f}): df_excl={len(df_excl):,} rows | RSS: {_rss_mb():.1f} MB", flush=True)
+
         # Filter to val S1 for evaluation
         if "is_competitor" in df_excl.columns:
             df_eval = df_excl[df_excl["is_competitor"] == 0].reset_index(drop=True)
@@ -184,6 +246,7 @@ def run_grid_search(
             df_eval = df_excl
 
         s1_data = precompute_s1_candidates(df_eval)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] After precompute_s1_candidates (ue={ue}, m={m:.2f}): s1_data={len(s1_data):,} entities | RSS: {_rss_mb():.1f} MB", flush=True)
 
         # Build valid (t1, te) pairs
         param_pairs = [(t1, te) for t1 in t_top1_vals for te in t_extra_vals if te >= t1]
@@ -352,8 +415,17 @@ def print_worst_diagnostics(
     cand_name_map = dict(zip(norm_cands[cand_id_col].values, norm_cands["raw_name"].values))
     cand_addr_map = dict(zip(norm_cands[cand_id_col].values, norm_cands["raw_address"].values))
 
-    # Build prob lookup map
+    # Build prob lookup map (supporting both int64 and str IDs)
+    is_int_probs = np.issubdtype(probs_df["s1_id"].dtype, np.integer)
     prob_map = dict(zip(zip(probs_df["s1_id"].values, probs_df["cand_id"].values), probs_df["prob"].values))
+
+    def _lookup_prob(s1_str: str, c_str: str) -> float:
+        if is_int_probs:
+            s1_k = int(s1_str.split("-")[1]) + 1_000_000_000_000
+            pfx = int(c_str[1]) * 1_000_000_000_000
+            c_k = pfx + int(c_str.split("-")[1])
+            return float(prob_map.get((s1_k, c_k), 0.0))
+        return float(prob_map.get((s1_str, c_str), 0.0))
 
     # 1. Identify False Merges: predicted in pred_map, but not in gold_map
     false_merges = []
@@ -361,7 +433,7 @@ def print_worst_diagnostics(
         g = gold_map.get(s1, set())
         for c in preds:
             if c not in g:
-                p = prob_map.get((s1, c), 0.0)
+                p = _lookup_prob(s1, c)
                 false_merges.append((s1, c, p))
 
     # Sort false merges by prob descending (highest confidence false positives)
@@ -373,13 +445,19 @@ def print_worst_diagnostics(
         preds = set(pred_map.get(s1, []))
         for c in g:
             if c not in preds:
-                p = prob_map.get((s1, c), 0.0)
+                p = _lookup_prob(s1, c)
                 misses.append((s1, c, p))
 
     # Sort misses by prob descending (candidates with high model prob that got dropped/missed)
     misses.sort(key=lambda x: x[2], reverse=True)
 
-    # Load feature rows for top-feature contribution
+    # Load feature rows for top-feature contribution ONLY for the worst pairs to avoid OOM
+    needed_pairs = set()
+    for s1, c, _ in false_merges[:limit]:
+        needed_pairs.add((s1, c))
+    for s1, c, _ in misses[:limit]:
+        needed_pairs.add((s1, c))
+
     feat_files = []
     for f in sorted(os.listdir(cache_dir)):
         if f.startswith("feats_train_chunk_") and f.endswith(".parquet"):
@@ -390,10 +468,17 @@ def print_worst_diagnostics(
                 feat_files.append(os.path.join(cache_dir, f))
 
     feat_lookup = {}
-    if feat_files:
-        all_f = [pd.read_parquet(fp, columns=["s1_id", "cand_id"] + config.FEATURES) for fp in feat_files]
-        full_feat = pd.concat(all_f, ignore_index=True).drop_duplicates(subset=["s1_id", "cand_id"])
-        feat_lookup = full_feat.set_index(["s1_id", "cand_id"])
+    if feat_files and needed_pairs:
+        matched_dfs = []
+        needed_s1 = {p[0] for p in needed_pairs}
+        for fp in feat_files:
+            cdf = pd.read_parquet(fp, columns=["s1_id", "cand_id"] + config.FEATURES)
+            sub_cdf = cdf[cdf["s1_id"].isin(needed_s1)]
+            if len(sub_cdf) > 0:
+                matched_dfs.append(sub_cdf)
+        if matched_dfs:
+            full_feat = pd.concat(matched_dfs, ignore_index=True).drop_duplicates(subset=["s1_id", "cand_id"])
+            feat_lookup = full_feat.set_index(["s1_id", "cand_id"])
 
     def get_top_features(s1, c, booster, is_fm=True):
         if (s1, c) not in feat_lookup.index:
@@ -480,13 +565,23 @@ def main():
     model_path = os.path.join(cache_dir, f"model_{args.version}.txt")
     booster = lgb.Booster(model_file=model_path) if os.path.exists(model_path) else None
 
+    # Convert val_s1 and gold_map to int64 for fast evaluation
+    val_s1_int = _id_to_int(pd.Series(val_s1), validate=True).tolist()
+    gold_map_int = {}
+    for s_str, s_int in zip(val_s1, val_s1_int):
+        g = gold_map[s_str]
+        if g:
+            gold_map_int[s_int] = set(_id_to_int(pd.Series(list(g)), validate=True).tolist())
+        else:
+            gold_map_int[s_int] = set()
+
     # Step 7 Sanity Reference Score
-    sanity_preds = decide(probs_df, t_top1=0.5, t_extra=0.8, margin=0.0, use_exclusivity=False, all_s1_ids=val_s1)
-    sanity_f05 = macro_f05(sanity_preds, gold_map)
+    sanity_preds = decide(probs_df, t_top1=0.5, t_extra=0.8, margin=0.0, use_exclusivity=False, all_s1_ids=val_s1_int)
+    sanity_f05 = macro_f05(sanity_preds, gold_map_int)
     print(f"\nStep 7 Sanity Reference (No Exclusivity, 0.50 / 0.80): Val Macro F0.5 = {sanity_f05:.4f}")
 
     # 4. Run grid search over (use_exclusivity, margin, t_top1, t_extra)
-    grid_results = run_grid_search(probs_df, gold_map, val_s1)
+    grid_results = run_grid_search(probs_df, gold_map_int, val_s1_int)
 
     print("\n" + "=" * 75)
     print("TOP 10 PARAMETER CONFIGURATIONS")
@@ -512,21 +607,27 @@ def main():
         t_extra=best_te,
         margin=best_m,
         use_exclusivity=best_ue,
-        all_s1_ids=val_s1
+        all_s1_ids=val_s1_int
     )
-    verified_score = macro_f05(best_preds, gold_map)
+    verified_score = macro_f05(best_preds, gold_map_int)
     assert abs(verified_score - best_score) < 1e-4, f"Mismatch: {verified_score} vs {best_score}"
 
     # 6. Save winning parameters to cache/thresholds.json
     save_tuned_thresholds(cache_dir=cache_dir, best_top1=best_t1, best_extra=best_te, best_margin=best_m, best_excl=best_ue)
 
+    # Convert best_preds back to strings for slice report and diagnostics
+    best_preds_str = {
+        _int_to_id(s): [_int_to_id(c) for c in cands]
+        for s, cands in best_preds.items()
+    }
+
     # 7. Generate Slice Report
     norm_s1 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source1.parquet"))
-    generate_slice_report(best_preds, gold_map, norm_s1)
+    generate_slice_report(best_preds_str, gold_map, norm_s1)
 
     # 8. Print Worst Diagnostics
     if booster is not None:
-        print_worst_diagnostics(best_preds, gold_map, probs_df, cache_dir, booster, limit=30)
+        print_worst_diagnostics(best_preds_str, gold_map, probs_df, cache_dir, booster, limit=30)
 
     # 9. Summary Comparison against Sanity and Rule Baseline
     rule_baseline_f05 = 0.9492  # From Step 7 report
