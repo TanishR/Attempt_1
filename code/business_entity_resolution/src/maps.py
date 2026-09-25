@@ -15,8 +15,6 @@ NAME_ABBREVIATIONS = {
     "ste": "societe",
     "grp": "groupe",
     # additional french abbreviations
-    "fils": "fils",
-    "freres": "freres",
     "praivet": "private",
     "praibhet": "private",
     "piraivet": "private",
@@ -32,11 +30,11 @@ NAME_ABBREVIATIONS = {
 LEGAL_SUFFIXES = {
     "private", "limited", "incorporated", "llc", "llp", "lp", "pc", "pllc",
     "corporation", "company", "sarl", "sas", "sasu", "sa", "sci", "eurl", "snc", 
-    "public", "m/s", "cie", "fils", "freres"
+    "public", "m/s", "cie", 
 }
 
 WEAK_TOKENS = {
-    "(india)", "shri", "the", "india", "usa", "france"
+    "(india)", "shri", "the", "usa", "france"
 }
 
 ADDR_ABBREVIATIONS = {

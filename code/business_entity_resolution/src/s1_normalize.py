@@ -23,6 +23,15 @@ def transliterate_if_needed(text):
 
 def get_consonant_skeleton(text):
     if not isinstance(text, str) or not text: return ""
+    text = text.lower()
+    
+    # Phonetic replacements BEFORE removing vowels
+    text = text.replace("ph", "f")
+    text = text.replace("q", "k")
+    text = text.replace("z", "j")
+    text = re.sub(r'c(?!h)', 'k', text)
+    text = re.sub(r'm(?=[cdfghjklmnqrstvwxz])', 'n', text)
+    
     vowels = set("aeiouy")
     words = text.split()
     skel_words = []
@@ -49,12 +58,15 @@ URL_CLEAN_RE = re.compile(r'\b(www\.)|(\.com|\.in|\.org|\.net|\.fr)\b')
 TRAILING_ID_RE = re.compile(r'[-\s#]+[0-9]{4,}\s*$')
 PUNCT_RE = re.compile(r'[^\w\s]')
 DOTTED_ACRONYM_RE = re.compile(r'\b([a-z])[\.\s]+(?=[a-z]\b)')
+NO_PREFIX_RE = re.compile(r'(?i)\b(n[°º]|no\.)\s*(?=\d)')
 
 def normalize_name(raw_name):
     if not isinstance(raw_name, str) or not raw_name.strip():
         return "", "", "", "", "", "", ""
         
-    n = transliterate_if_needed(raw_name).lower()
+    n = raw_name
+    n = NO_PREFIX_RE.sub(' ', n)
+    n = transliterate_if_needed(n).lower()
     
     if '|' in n:
         parts = n.split('|')
@@ -64,12 +76,12 @@ def normalize_name(raw_name):
             n = n.replace('|', ' ')
             
     n = URL_CLEAN_RE.sub('', n)
+    n = n.replace('(india)', ' ')
     
     # Apostrophes
     n = n.replace("'", "").replace("’", "")
     
     # Dotted acronyms
-    # Apply repeatedly to handle L.L.C. -> LLC
     while True:
         n_new = DOTTED_ACRONYM_RE.sub(r'\1', n)
         if n_new == n: break
@@ -127,11 +139,27 @@ def normalize_name(raw_name):
         
     return name_full, name_a, name_b, core_name, legal, core_sorted, name_skel
 
+STREET_WORDS = {
+    "rue", "avenue", "road", "street", "boulevard", "allee", "impasse", "route", "faubourg", "lane", "drive", "way", "court", "st", "ave", "rd", "blvd", "dr", "ln", "ct", "pl", "ter"
+}
+STOPWORDS = {"de", "du", "la", "le", "des", "of", "the"}
+STATE_WORDS = set(STATE_MAP.keys()).union(set(STATE_MAP.values()))
+
+def extract_street_token(tokens, house_no_idx=-1):
+    start_idx = house_no_idx + 1 if house_no_idx != -1 else 0
+    for t in tokens[start_idx:]:
+        if len(t) >= 4 and t.isalpha():
+            if t not in STREET_WORDS and t not in STOPWORDS and t not in STATE_WORDS:
+                return t
+    return ""
+
 def normalize_address(raw_addr):
     if not isinstance(raw_addr, str) or not raw_addr.strip() or raw_addr.strip().lower() == "null":
-        return "", "", "", 0, "", "", "", 1
+        return "", "", "", 0, "", "", "", 1, ""
         
-    a = transliterate_if_needed(raw_addr).lower()
+    a = raw_addr
+    a = NO_PREFIX_RE.sub(' ', a)
+    a = transliterate_if_needed(a).lower()
     a = a.replace('&', ' and ')
     a_punct_removed = PUNCT_RE.sub(' ', a)
     
@@ -163,20 +191,31 @@ def normalize_address(raw_addr):
     house_masked = 0
     
     raw_tokens = a.split()
-    for rt in raw_tokens:
+    house_no_idx_in_addr = -1
+    for i, rt in enumerate(raw_tokens):
         if any(c.isdigit() for c in rt):
             if "#" in rt:
                 digits_only = "".join(c for c in rt if c.isdigit())
                 if digits_only:
                     house_no = digits_only.lstrip("0") or "0"
                     house_masked = 1
+                    # find approx index in addr_tokens
+                    # we just match by finding the first token that contains these digits
                     break
             else:
                 digits_only = "".join(c for c in rt if c.isdigit())
                 if digits_only:
                     house_no = digits_only.lstrip("0") or "0"
                     break
-                
+                    
+    # For street_token extraction, find index of house_no in addr_tokens
+    for i, t in enumerate(addr_tokens):
+        if any(c.isdigit() for c in t) and (t.lstrip('0') or '0') == house_no:
+            house_no_idx_in_addr = i
+            break
+            
+    street_token = extract_street_token(addr_tokens, house_no_idx_in_addr)
+    
     zip_pin = ""
     for t in reversed(tokens):
         if len(t) in (5, 6) and t.isdigit():
@@ -185,20 +224,18 @@ def normalize_address(raw_addr):
             
     state_code = ""
     for i in range(len(addr_tokens)):
-        # try 2-grams
         if i < len(addr_tokens) - 1:
             bigram = addr_tokens[i] + " " + addr_tokens[i+1]
             if bigram in STATE_MAP:
                 state_code = STATE_MAP[bigram]
                 break
-        # try 1-grams
         if addr_tokens[i] in STATE_MAP:
             state_code = STATE_MAP[addr_tokens[i]]
             break
             
     addr_missing = 1 if not addr_norm else 0
     
-    return addr_norm, unit_toks_str, house_no, house_masked, num_toks_str, zip_pin, state_code, addr_missing
+    return addr_norm, unit_toks_str, house_no, house_masked, num_toks_str, zip_pin, state_code, addr_missing, street_token
 
 def process_chunk(df_chunk):
     results = []
@@ -209,7 +246,7 @@ def process_chunk(df_chunk):
         raw_addr = row.get("business_address", "")
         
         n_full, n_a, n_b, core, legal, c_sorted, skel = normalize_name(raw_name)
-        a_norm, a_unit, h_no, h_mask, num_tok, z_pin, st_code, a_miss = normalize_address(raw_addr)
+        a_norm, a_unit, h_no, h_mask, num_tok, z_pin, st_code, a_miss, st_tok = normalize_address(raw_addr)
         
         if not n_full and raw_name and str(raw_name).strip():
             fallback = transliterate_if_needed(raw_name).lower()
@@ -239,7 +276,8 @@ def process_chunk(df_chunk):
             "num_tokens": num_tok,
             "zip_pin": z_pin,
             "state_code": st_code,
-            "addr_missing": a_miss
+            "addr_missing": a_miss,
+            "street_token": st_tok
         })
     return pd.DataFrame(results)
 
