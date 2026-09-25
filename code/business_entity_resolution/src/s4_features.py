@@ -205,6 +205,8 @@ def load_norm_table(cache_dir, split, source, needed_ids=None, columns=None):
     """
     Loads normalized table for a source with fallback paths across train and test splits,
     restricted to only the needed entity IDs and columns.
+    Low-cardinality string columns ('country', 'legal', 'state_code') are converted
+    to 'category' dtype to minimize memory footprint.
     Returns: pandas.DataFrame indexed by entity_id.
     """
     paths_to_try = [
@@ -221,13 +223,18 @@ def load_norm_table(cache_dir, split, source, needed_ids=None, columns=None):
             df = pd.read_parquet(p, columns=cols_to_read)
             if needed_ids is not None:
                 df = df[df["entity_id"].isin(needed_ids)]
+            for cat_col in ['country', 'legal', 'state_code']:
+                if cat_col in df.columns:
+                    df[cat_col] = df[cat_col].astype('category')
             return df.set_index("entity_id")
     raise FileNotFoundError(f"Could not find normalized table for {source} in {cache_dir}")
 
 
 def load_candidate_embeddings(cache_dir, split, needed_cand_ids=None):
     """
-    Loads candidate main embeddings for Source 2 and Source 3 into a stacked float32 matrix.
+    Loads candidate main embeddings for Source 2 and Source 3 into a stacked float16 matrix.
+    Uses mmap_mode='r' to read directly from disk into a pre-allocated float16 array,
+    avoiding intermediate float32 copies and np.vstack memory duplication.
     If needed_cand_ids is provided, restricts to only those candidate IDs.
     Returns: tuple of (all_cand_emb, id_to_row_map).
     """
@@ -245,23 +252,38 @@ def load_candidate_embeddings(cache_dir, split, needed_cand_ids=None):
     if not os.path.exists(s3_id_p):
         s3_id_p = os.path.join(cache_dir, "ids_train_source3.npy")
 
-    s2_emb = np.load(s2_m_p)
     s2_ids = np.load(s2_id_p, allow_pickle=True)
+    s2_mmap = np.load(s2_m_p, mmap_mode='r')
     if needed_cand_ids is not None:
         s2_mask = pd.Series(s2_ids).isin(needed_cand_ids).values
-        s2_emb = s2_emb[s2_mask]
         s2_ids = s2_ids[s2_mask]
+        s2_indices = np.where(s2_mask)[0]
+    else:
+        s2_indices = slice(None)
 
-    s3_emb = np.load(s3_m_p)
     s3_ids = np.load(s3_id_p, allow_pickle=True)
+    s3_mmap = np.load(s3_m_p, mmap_mode='r')
     if needed_cand_ids is not None:
         s3_mask = pd.Series(s3_ids).isin(needed_cand_ids).values
-        s3_emb = s3_emb[s3_mask]
         s3_ids = s3_ids[s3_mask]
+        s3_indices = np.where(s3_mask)[0]
+    else:
+        s3_indices = slice(None)
 
-    all_cand_emb = np.vstack([s2_emb, s3_emb]).astype(np.float32)
-    id_to_row = {cid: idx for idx, cid in enumerate(s2_ids)}
     n_s2 = len(s2_ids)
+    n_s3 = len(s3_ids)
+    n_total = n_s2 + n_s3
+    dim = s2_mmap.shape[1]
+
+    # Pre-allocate single float16 matrix directly (half memory of float32, no np.vstack duplication)
+    all_cand_emb = np.empty((n_total, dim), dtype=np.float16)
+    all_cand_emb[:n_s2] = s2_mmap[s2_indices].astype(np.float16)
+    all_cand_emb[n_s2:] = s3_mmap[s3_indices].astype(np.float16)
+
+    del s2_mmap, s3_mmap
+    import gc; gc.collect()
+
+    id_to_row = {cid: idx for idx, cid in enumerate(s2_ids)}
     for idx, cid in enumerate(s3_ids):
         id_to_row[cid] = n_s2 + idx
 
@@ -271,6 +293,7 @@ def load_candidate_embeddings(cache_dir, split, needed_cand_ids=None):
 def compute_support_feature(chunk_df, all_cand_emb, id_to_row):
     """
     Computes max cosine similarity to other top-5 candidates (by emb_score) for each S1.
+    Processes in small blocks of S1 entities to avoid allocating a multi-gigabyte vector slice.
     Returns: numpy.ndarray of float32 support scores aligned with chunk_df rows.
     """
     n_rows = len(chunk_df)
@@ -286,23 +309,37 @@ def compute_support_feature(chunk_df, all_cand_emb, id_to_row):
     s1_sorted = df_sorted['s1_id'].values
     c_sorted = df_sorted['cand_id'].values
     sorted_orig_idx = df_sorted['orig_idx'].values
+    del df_sorted
 
     c_rows = np.array([id_to_row.get(cid, 0) for cid in c_sorted], dtype=np.int32)
-    cand_vecs = all_cand_emb[c_rows]
+    del c_sorted
 
     unique_s1, start_indices, counts = np.unique(s1_sorted, return_index=True, return_counts=True)
+    del s1_sorted
     sorted_support = np.zeros(n_rows, dtype=np.float32)
+    n_s1 = len(unique_s1)
 
-    for start, count in zip(start_indices, counts):
-        if count <= 1:
-            continue
-        k = min(count, 5)
-        E = cand_vecs[start : start + count]
-        T = E[:k]  # Exactly the top-5 candidates by emb_score
-        M = np.dot(E, T.T)
-        for i in range(k):
-            M[i, i] = -999.0  # Exclude self-similarity
-        sorted_support[start : start + count] = np.max(M, axis=1)
+    block_size = 2000  # Process 2000 S1 entities per block (~80,000 candidate rows, ~60 MB)
+    for b in range(0, n_s1, block_size):
+        b_end = min(b + block_size, n_s1)
+        b_start_row = start_indices[b]
+        b_end_row = start_indices[b_end - 1] + counts[b_end - 1]
+
+        b_c_rows = c_rows[b_start_row:b_end_row]
+        b_vecs = all_cand_emb[b_c_rows].astype(np.float32)
+
+        curr_offset = 0
+        for s_i in range(b, b_end):
+            cnt = counts[s_i]
+            if cnt > 1:
+                k = min(cnt, 5)
+                E = b_vecs[curr_offset : curr_offset + cnt]
+                T = E[:k]
+                M = np.dot(E, T.T)
+                for i in range(k):
+                    M[i, i] = -999.0
+                sorted_support[start_indices[s_i] : start_indices[s_i] + cnt] = np.max(M, axis=1)
+            curr_offset += cnt
 
     support = np.zeros(n_rows, dtype=np.float32)
     support[sorted_orig_idx] = sorted_support
@@ -388,8 +425,8 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
     del s1_tok_map, c_tok_map, s1_tsets, c_tsets
 
     # 4. legal_match: 1 if present and equal, 0 if present and different, -1 if missing
-    s1_leg = s1_sub['legal'].values
-    c_leg = cand_sub['legal'].values
+    s1_leg = s1_sub['legal'].to_numpy()
+    c_leg = cand_sub['legal'].to_numpy()
     leg_miss = (s1_leg == '') | (c_leg == '')
     legal_match = np.where(leg_miss, -1, np.where(s1_leg == c_leg, 1, 0)).astype(np.float32)
 
@@ -429,8 +466,8 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
     z_miss = (s1_z == '') | (c_z == '')
     zip_match = np.where(z_miss, -1, np.where(s1_z == c_z, 1, 0)).astype(np.float32)
 
-    s1_st = s1_sub['state_code'].values
-    c_st = cand_sub['state_code'].values
+    s1_st = s1_sub['state_code'].to_numpy()
+    c_st = cand_sub['state_code'].to_numpy()
     st_miss = (s1_st == '') | (c_st == '')
     state_match = np.where(st_miss, -1, np.where(s1_st == c_st, 1, 0)).astype(np.float32)
 
@@ -457,8 +494,8 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
     del s1_num_map, c_num_map, s1_num, c_num
 
     # 11. rare_tok_overlap: count of shared tokens among each side's 3 rarest address tokens
-    s1_r3_map = {eid: extract_rare3_set(addr, ctry, df_tokens) for eid, addr, ctry in zip(chunk_s1_unique, s1_df.loc[chunk_s1_unique, 'addr_norm'], s1_df.loc[chunk_s1_unique, 'country'])}
-    c_r3_map = {cid: extract_rare3_set(addr, ctry, df_tokens) for cid, addr, ctry in zip(chunk_c_unique, cands_df.loc[chunk_c_unique, 'addr_norm'], cands_df.loc[chunk_c_unique, 'country'])}
+    s1_r3_map = {eid: extract_rare3_set(addr, str(ctry), df_tokens) for eid, addr, ctry in zip(chunk_s1_unique, s1_df.loc[chunk_s1_unique, 'addr_norm'], s1_df.loc[chunk_s1_unique, 'country'])}
+    c_r3_map = {cid: extract_rare3_set(addr, str(ctry), df_tokens) for cid, addr, ctry in zip(chunk_c_unique, cands_df.loc[chunk_c_unique, 'addr_norm'], cands_df.loc[chunk_c_unique, 'country'])}
     s1_r3 = [s1_r3_map[eid] for eid in s1_ids]
     c_r3 = [c_r3_map[cid] for cid in cand_ids]
     rare_tok_overlap = np.array([
@@ -468,6 +505,7 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
 
     # 12. addr_missing_any: 1 if address empty on either side, else 0
     addr_missing_any = ((np.array(s1_ad) == '') | (np.array(c_ad) == '')).astype(np.float32)
+    del s1_nf, c_nf, s1_cn, c_cn, s1_sk, c_sk, s1_ad, c_ad, s1_sub, cand_sub
 
     # 13. Channel flags and cand_source
     cand_source = chunk_df['cand_source'].values.astype(np.float32)
@@ -666,45 +704,128 @@ def compute_global_reverse_ranks(cache_dir, split, chunk_files, sampled_s1_ids=N
     return chunk_rr_list, chunk_keep_mask_list, chunk_is_comp_list, needed_s1_ids, needed_cand_ids, counts_info
 
 
-def print_acceptance_report(feats_df, elapsed_time):
+def print_acceptance_report(chunk_files, cache_dir, split, elapsed_time):
     """
-    Prints the per-feature acceptance verification table and runtime statistics.
+    Computes summary statistics streaming chunk-by-chunk without loading all chunks
+    into memory at once, then prints the acceptance verification table and runtime statistics.
     Returns: None.
     """
-    n_pairs = len(feats_df)
-    labels = feats_df['label'].values if 'label' in feats_df.columns else None
+    target_paths = []
+    for idx, cf in enumerate(chunk_files):
+        chunk_suffix = os.path.basename(cf).replace(f"cands_{split}_", "").replace(".parquet", "")
+        out_p1 = os.path.join(cache_dir, f"feats_{split}_{chunk_suffix}.parquet")
+        out_p2 = os.path.join(cache_dir, f"feats_{split}_{idx}.parquet")
+        target_p = out_p1 if os.path.exists(out_p1) else out_p2
+        if os.path.exists(target_p):
+            target_paths.append(target_p)
+
+    if not target_paths:
+        print("No feature rows produced.")
+        return
+
+    n_pairs = 0
+    n_comp_pairs = 0
+    comp_s1_set = set()
+    has_labels = False
+    has_comp = False
+
+    f_min = {f: float('inf') for f in config.FEATURES}
+    f_max = {f: float('-inf') for f in config.FEATURES}
+    f_sum = {f: 0.0 for f in config.FEATURES}
+    f_nan = {f: 0 for f in config.FEATURES}
+    f_pos_sum = {f: 0.0 for f in config.FEATURES}
+    f_pos_cnt = {f: 0 for f in config.FEATURES}
+    f_neg_sum = {f: 0.0 for f in config.FEATURES}
+    f_neg_cnt = {f: 0 for f in config.FEATURES}
+
+    rs_min = float('inf')
+    rs_max = float('-inf')
+    rs_sum = 0.0
+    rs_pos_sum = 0.0
+    rs_pos_cnt = 0
+    rs_neg_sum = 0.0
+    rs_neg_cnt = 0
+
+    for tp in target_paths:
+        df_chunk = pd.read_parquet(tp)
+        clen = len(df_chunk)
+        if clen == 0:
+            continue
+        n_pairs += clen
+
+        labels = df_chunk['label'].values if 'label' in df_chunk.columns else None
+        if labels is not None:
+            has_labels = True
+
+        if 'is_competitor' in df_chunk.columns:
+            has_comp = True
+            c_mask = df_chunk['is_competitor'] == 1
+            n_comp_pairs += int(c_mask.sum())
+            if c_mask.any():
+                comp_s1_set.update(df_chunk.loc[c_mask, 's1_id'].unique())
+
+        rs = df_chunk['rule_score'].values.astype(np.float32)
+        rs_min = min(rs_min, float(rs.min()))
+        rs_max = max(rs_max, float(rs.max()))
+        rs_sum += float(rs.sum())
+        if labels is not None:
+            rs_pos_sum += float(rs[labels == 1].sum())
+            rs_pos_cnt += int((labels == 1).sum())
+            rs_neg_sum += float(rs[labels == 0].sum())
+            rs_neg_cnt += int((labels == 0).sum())
+
+        for fname in config.FEATURES:
+            vals = df_chunk[fname].values.astype(np.float32)
+            nan_m = np.isnan(vals)
+            f_nan[fname] += int(nan_m.sum())
+            valid = ~nan_m
+            if valid.any():
+                v_valid = vals[valid]
+                f_min[fname] = min(f_min[fname], float(v_valid.min()))
+                f_max[fname] = max(f_max[fname], float(v_valid.max()))
+                f_sum[fname] += float(v_valid.sum())
+                if labels is not None:
+                    pos_m = (labels == 1) & valid
+                    neg_m = (labels == 0) & valid
+                    f_pos_sum[fname] += float(vals[pos_m].sum())
+                    f_pos_cnt[fname] += int(pos_m.sum())
+                    f_neg_sum[fname] += float(vals[neg_m].sum())
+                    f_neg_cnt[fname] += int(neg_m.sum())
+
+        del df_chunk
 
     print("\n" + "=" * 90)
     print(f"STEP 6 FEATURE VERIFICATION REPORT ({n_pairs:,} candidate pairs)")
     print("=" * 90)
-    if 'is_competitor' in feats_df.columns:
-        n_comp_pairs = int((feats_df['is_competitor'] == 1).sum())
-        n_comp_s1 = int(feats_df.loc[feats_df['is_competitor'] == 1, 's1_id'].nunique())
-        print(f"Competitor S1: {n_comp_s1:,} entities ({n_comp_pairs:,} candidate pairs)")
+    if has_comp:
+        print(f"Competitor S1: {len(comp_s1_set):,} entities ({n_comp_pairs:,} candidate pairs)")
         print("-" * 90)
 
     print(f"{'Feature':<20} | {'Min':>7} | {'Max':>7} | {'Mean':>8} | {'% NaN':>6} | {'Pos Mean':>9} | {'Neg Mean':>9}")
     print("-" * 90)
 
     for fname in config.FEATURES:
-        vals = feats_df[fname].values.astype(np.float32)
-        fmin = np.nanmin(vals)
-        fmax = np.nanmax(vals)
-        fmean = np.nanmean(vals)
-        pct_nan = np.isnan(vals).mean() * 100
-        if labels is not None:
-            pos_mean = np.nanmean(vals[labels == 1])
-            neg_mean = np.nanmean(vals[labels == 0])
+        fmin = f_min[fname] if f_min[fname] != float('inf') else float('nan')
+        fmax = f_max[fname] if f_max[fname] != float('-inf') else float('nan')
+        valid_cnt = n_pairs - f_nan[fname]
+        fmean = (f_sum[fname] / valid_cnt) if valid_cnt > 0 else float('nan')
+        pct_nan = (f_nan[fname] / n_pairs) * 100 if n_pairs > 0 else 0.0
+
+        if has_labels:
+            pos_mean = (f_pos_sum[fname] / f_pos_cnt[fname]) if f_pos_cnt[fname] > 0 else float('nan')
+            neg_mean = (f_neg_sum[fname] / f_neg_cnt[fname]) if f_neg_cnt[fname] > 0 else float('nan')
             print(f"{fname:<20} | {fmin:7.2f} | {fmax:7.2f} | {fmean:8.2f} | {pct_nan:5.1f}% | {pos_mean:9.2f} | {neg_mean:9.2f}")
         else:
             print(f"{fname:<20} | {fmin:7.2f} | {fmax:7.2f} | {fmean:8.2f} | {pct_nan:5.1f}% | {'N/A':>9} | {'N/A':>9}")
 
-    rs = feats_df['rule_score'].values
     print("-" * 90)
-    if labels is not None:
-        print(f"{'rule_score':<20} | {rs.min():7.2f} | {rs.max():7.2f} | {rs.mean():8.2f} | {'0.0%':>6} | {rs[labels == 1].mean():9.2f} | {rs[labels == 0].mean():9.2f}")
+    rs_mean = rs_sum / n_pairs if n_pairs > 0 else float('nan')
+    if has_labels:
+        rs_pos_mean = rs_pos_sum / rs_pos_cnt if rs_pos_cnt > 0 else float('nan')
+        rs_neg_mean = rs_neg_sum / rs_neg_cnt if rs_neg_cnt > 0 else float('nan')
+        print(f"{'rule_score':<20} | {rs_min:7.2f} | {rs_max:7.2f} | {rs_mean:8.2f} | {'0.0%':>6} | {rs_pos_mean:9.2f} | {rs_neg_mean:9.2f}")
     else:
-        print(f"{'rule_score':<20} | {rs.min():7.2f} | {rs.max():7.2f} | {rs.mean():8.2f} | {'0.0%':>6} | {'N/A':>9} | {'N/A':>9}")
+        print(f"{'rule_score':<20} | {rs_min:7.2f} | {rs_max:7.2f} | {rs_mean:8.2f} | {'0.0%':>6} | {'N/A':>9} | {'N/A':>9}")
     print("=" * 90)
 
     # Runtime and extrapolation
@@ -813,15 +934,7 @@ def main():
 
     if not pending_chunks:
         print("\nAll feature chunks already computed. Loading results for acceptance checks...")
-        all_feats = []
-        for idx, cf in enumerate(chunk_files):
-            chunk_suffix = os.path.basename(cf).replace(f"cands_{args.split}_", "").replace(".parquet", "")
-            out_p1 = os.path.join(cache_dir, f"feats_{args.split}_{chunk_suffix}.parquet")
-            out_p2 = os.path.join(cache_dir, f"feats_{args.split}_{idx}.parquet")
-            target_p = out_p1 if os.path.exists(out_p1) else out_p2
-            all_feats.append(pd.read_parquet(target_p))
-        df_full = pd.concat(all_feats, ignore_index=True)
-        print_acceptance_report(df_full, elapsed_time=0.0)
+        print_acceptance_report(chunk_files, cache_dir, args.split, elapsed_time=0.0)
         return
 
     if args.max_chunks is not None:
@@ -858,13 +971,37 @@ def main():
     print(f"Candidate embeddings ready: {len(all_cand_emb):,} vectors in {time.time() - t_emb:.2f}s "
           f"(RSS {_rss_mb():.0f} MB)", flush=True)
 
+    # Baseline memory breakdown
+    s1_mem = s1_norm.memory_usage(deep=True).sum() / 1_048_576
+    cands_mem = cands_norm.memory_usage(deep=True).sum() / 1_048_576
+    emb_mem = all_cand_emb.nbytes / 1_048_576
+    id_map_mem = sys.getsizeof(cand_id_map) / 1_048_576
+    rr_mem = sum(arr.nbytes for arr in chunk_rr_list if arr is not None) / 1_048_576
+    mask_mem = sum(arr.nbytes for arr in chunk_keep_masks if arr is not None) / 1_048_576
+    comp_mem = sum(arr.nbytes for arr in chunk_is_comps if arr is not None) / 1_048_576
+    df_mem = sum(sys.getsizeof(v) for v in df_tokens.values()) / 1_048_576
+    total_baseline_mem = s1_mem + cands_mem + emb_mem + id_map_mem + rr_mem + mask_mem + comp_mem + df_mem
+
+    print("\n" + "=" * 80)
+    print("STEP 6 BASELINE IN-MEMORY OBJECT SIZES")
+    print("=" * 80)
+    print(f"Source 1 Table (s1_norm)       : {s1_mem:8.1f} MB ({len(s1_norm):,} rows)")
+    print(f"Candidate Table (cands_norm)   : {cands_mem:8.1f} MB ({len(cands_norm):,} rows)")
+    print(f"Candidate Embeddings (float16) : {emb_mem:8.1f} MB ({len(all_cand_emb):,} vectors, {all_cand_emb.dtype})")
+    print(f"Candidate ID Map (dict)        : {id_map_mem:8.1f} MB ({len(cand_id_map):,} entries)")
+    print(f"Reverse Rank & Chunk Masks     : {rr_mem + mask_mem + comp_mem:8.1f} MB ({len(chunk_files)} chunks)")
+    print(f"Address Document Frequencies   : {df_mem:8.1f} MB ({sum(len(v) for v in df_tokens.values()):,} tokens)")
+    print("-" * 80)
+    print(f"Total Baseline In-Memory Size  : {total_baseline_mem:8.1f} MB ({total_baseline_mem/1024:.2f} GB)")
+    print(f"Current Process RSS            : {_rss_mb():8.1f} MB")
+    print("=" * 80 + "\n", flush=True)
+
     # 8. Process each pending chunk
     #    Per-S1 context features (gap_to_best, n_cands, support) must be computed
     #    on the FULL candidate list of each S1 BEFORE filtering competitor S1 down
     #    to only the shared pairs. This is because gap_to_best depends on the best
     #    emb_score across all 40 candidates, n_cands should be 40, and support
     #    depends on the top-5 candidates by emb_score.
-    processed_feats = []
     t_feat_start = time.time()
     for idx, cf, out_p1, out_p2 in pending_chunks:
         print(f"\nProcessing chunk {idx + 1}/{len(chunk_files)}: {cf}...", flush=True)
@@ -884,6 +1021,9 @@ def main():
             pd.DataFrame(columns=['s1_id', 'cand_id']).to_parquet(out_p1, index=False)
             if out_p1 != out_p2:
                 pd.DataFrame(columns=['s1_id', 'cand_id']).to_parquet(out_p2, index=False)
+            chunk_rr_list[idx] = None
+            chunk_keep_masks[idx] = None
+            chunk_is_comps[idx] = None
             continue
 
         # Context: ALL rows for S1 IDs that have any kept row
@@ -924,34 +1064,22 @@ def main():
         if out_p1 != out_p2:
             feats_df.to_parquet(out_p2, index=False)
 
+        # Free this chunk's reverse rank and masks immediately
+        chunk_rr_list[idx] = None
+        chunk_keep_masks[idx] = None
+        chunk_is_comps[idx] = None
+
         rss_aft = _rss_mb()
         print(f"Saved chunk {idx + 1} features ({len(feats_df):,} pairs) to {out_p1} "
               f"in {time.time() - t_ch:.2f}s  (RSS {rss_aft:.0f} MB)", flush=True)
-        processed_feats.append(feats_df)
+
+        del chunk_full, context_mask, kept_df, kept_gap, kept_nc, kept_sup, feats_df
+        import gc; gc.collect()
 
     t_feat_total = time.time() - t_feat_start
 
-    # 9. Merge all chunks for summary report and validation
-    all_feats = []
-    for idx, cf in enumerate(chunk_files):
-        chunk_suffix = os.path.basename(cf).replace(f"cands_{args.split}_", "").replace(".parquet", "")
-        out_p1 = os.path.join(cache_dir, f"feats_{args.split}_{chunk_suffix}.parquet")
-        out_p2 = os.path.join(cache_dir, f"feats_{args.split}_{idx}.parquet")
-        target_p = out_p1 if os.path.exists(out_p1) else out_p2
-        if os.path.exists(target_p):
-            df_chunk = pd.read_parquet(target_p)
-            if len(df_chunk) > 0:
-                all_feats.append(df_chunk)
-    if all_feats:
-        df_full = pd.concat(all_feats, ignore_index=True)
-    else:
-        df_full = pd.DataFrame()
-
-    # Acceptance report
-    if len(df_full) > 0:
-        print_acceptance_report(df_full, elapsed_time=t_feat_total)
-    else:
-        print("No feature rows produced.")
+    # 9. Summary report and validation (streaming chunk-by-chunk, zero accumulation)
+    print_acceptance_report(chunk_files, cache_dir, args.split, elapsed_time=t_feat_total)
 
     print(f"\nStep 6 finished in {time.time() - t_start:.2f}s. Final RSS: {_rss_mb():.0f} MB", flush=True)
 

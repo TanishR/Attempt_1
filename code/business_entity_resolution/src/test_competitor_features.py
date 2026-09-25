@@ -35,10 +35,14 @@ def create_competitor_test_cache():
     for f in os.listdir(LAPTOP_CACHE):
         src = os.path.join(LAPTOP_CACHE, f)
         dst = os.path.join(COMP_CACHE, f)
-        if f.startswith('feats_') or f == 'split.parquet' or f == 'addr_df_train.parquet':
+        if f.startswith('feats_') or f == 'split.parquet' or f == 'addr_df_train.parquet' or f == 'baseline_feats.parquet':
             continue  # Skip these, we'll create our own split
         if os.path.isfile(src) and not os.path.exists(dst):
             shutil.copy2(src, dst)
+
+    b_path = os.path.join(COMP_CACHE, 'baseline_feats.parquet')
+    if os.path.exists(b_path):
+        os.remove(b_path)
 
     # Load the candidate chunk to understand the S1 IDs
     cands = pd.read_parquet(os.path.join(LAPTOP_CACHE, 'cands_train_chunk_0.parquet'))
