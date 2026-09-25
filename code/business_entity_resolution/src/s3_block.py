@@ -788,17 +788,29 @@ def main():
         gc.collect()
 
     # --------------------------------------------------------------------------
-    # Post-processing: build final cands_{split}.parquet without loading all
-    # chunks at once with string IDs (prevents 31-GB OOM).
-    # Strategy: read each chunk with categorical IDs, concat, save.
-    # For the recall report we only load val-sample S1 rows.
+    # Post-processing: NO combined 9-crore parquet.
+    #
+    # Problem with the previous approach: pd.concat on Categorical columns where
+    # each chunk has different categories silently reverts to str/object dtype,
+    # giving ZERO memory saving (confirmed: dtype='str' after concat in tests).
+    #
+    # Solution: never build the combined DataFrame at all.
+    #   - Recall report reads only val-sample S1 rows, chunk by chunk.
+    #   - s4_features.py already reads per-chunk files directly.
+    #   - cands_{split}.parquet is NOT written (downstream must use chunk files).
     # --------------------------------------------------------------------------
     elapsed_total = time.time() - start_total_time
     rss_post = _rss_mb()
-    print(f"\n--- Post-processing: merging {len(chunk_files)} chunk(s)  "
+    print(f"\n--- Post-processing: {len(chunk_files)} chunk(s)  "
           f"(elapsed so far {elapsed_total:.0f}s, RSS {rss_post:.0f} MB) ---", flush=True)
 
-    final_cands_path = os.path.join(cache_dir, f"cands_{args.split}.parquet")
+    # Count total pairs from chunk metadata only (no full load)
+    total_pairs_count = 0
+    existing_chunks = [cp for cp in chunk_files if os.path.exists(cp)]
+    for cp in existing_chunks:
+        meta = pd.read_parquet(cp, columns=['s1_id']).shape[0]
+        total_pairs_count += meta
+    print(f"  Total candidate pairs across {len(existing_chunks)} chunks: {total_pairs_count:,}", flush=True)
 
     # Determine val-sample S1 ids for the recall report (train only)
     val_s1_set = set()
@@ -809,50 +821,30 @@ def main():
             val_s1_set = set(split_df['s1_id'].values)
             print(f"  Val-sample S1 for recall report: {len(val_s1_set):,}", flush=True)
 
-    # Read chunks with categorical IDs to keep peak RAM low
-    chunk_dfs_cat = []
-    total_pairs_count = 0
-    for ci, cp in enumerate(chunk_files):
-        if not os.path.exists(cp):
-            continue
-        df_c = pd.read_parquet(cp)
-        # Convert string IDs to categoricals (much smaller in RAM)
-        df_c['s1_id'] = df_c['s1_id'].astype('category')
-        df_c['cand_id'] = df_c['cand_id'].astype('category')
-        total_pairs_count += len(df_c)
-        chunk_dfs_cat.append(df_c)
-        rss_ci = _rss_mb()
-        print(f"  Read chunk {ci + 1}/{len(chunk_files)}: {len(df_c):,} pairs  (RSS {rss_ci:.0f} MB)", flush=True)
-        del df_c
-        gc.collect()
-
-    if chunk_dfs_cat:
-        print(f"  Concatenating {len(chunk_dfs_cat)} chunks ({total_pairs_count:,} total pairs)...", flush=True)
-        final_df = pd.concat(chunk_dfs_cat, ignore_index=True)
-        # Restore string IDs
-        final_df['s1_id'] = final_df['s1_id'].astype(str)
-        final_df['cand_id'] = final_df['cand_id'].astype(str)
-        del chunk_dfs_cat
-        gc.collect()
-    else:
-        final_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank',
-                                         'ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev'])
-
-    final_df.to_parquet(final_cands_path, index=False)
-    elapsed_total = time.time() - start_total_time
-    rss_final = _rss_mb()
-    print(f"\nFinal candidates saved to: {final_cands_path}", flush=True)
-    print(f"Total candidate pairs: {len(final_df):,} in {elapsed_total:.2f}s  (RSS {rss_final:.0f} MB)", flush=True)
-
-    # Recall report: only load val-sample S1 rows to avoid reloading full final_df
+    # Recall report: filter to val-sample S1 per chunk, concat small result
     if args.split == "train" and gt_df is not None:
-        print("\n--- Running recall report (val-sample S1 only) ---", flush=True)
-        if val_s1_set:
-            recall_df = final_df[final_df['s1_id'].isin(val_s1_set)].copy()
-        else:
-            recall_df = final_df
+        print("\n--- Running recall report (val-sample rows only, no full concat) ---", flush=True)
+        val_chunk_dfs = []
+        for ci, cp in enumerate(existing_chunks):
+            df_c = pd.read_parquet(cp)
+            if val_s1_set:
+                df_c = df_c[df_c['s1_id'].isin(val_s1_set)]
+            val_chunk_dfs.append(df_c)
+            rss_ci = _rss_mb()
+            print(f"  Chunk {ci + 1}/{len(existing_chunks)}: kept {len(df_c):,} val rows  "
+                  f"(RSS {rss_ci:.0f} MB)", flush=True)
+            del df_c
+            gc.collect()
+
+        recall_df = pd.concat(val_chunk_dfs, ignore_index=True)
         rss_recall = _rss_mb()
-        print(f"  Recall report rows: {len(recall_df):,}  (RSS {rss_recall:.0f} MB)", flush=True)
+        # After concat of uniform-schema small frames: show dtype so it is auditable
+        print(f"  Recall df: {len(recall_df):,} rows, "
+              f"s1_id dtype={recall_df['s1_id'].dtype}, "
+              f"cand_id dtype={recall_df['cand_id'].dtype}  "
+              f"(RSS {rss_recall:.0f} MB)", flush=True)
+        del val_chunk_dfs
+        gc.collect()
 
         norm_cols = ['entity_id', 'name_full', 'addr_norm', 'country']
         norm_s1 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source1.parquet"),
@@ -866,15 +858,10 @@ def main():
         del recall_df, norm_s1, norm_s2, norm_s3
         gc.collect()
 
-        if CAND_CAP < 50:
-            is_sym = (final_df['ch_addr'] == 1) | (final_df['ch_skel'] == 1) | (final_df.get('ch_rare', 0) == 1)
-            final_df = final_df.assign(is_sym=is_sym).sort_values(
-                ['s1_id', 'is_sym', 'emb_score'], ascending=[True, False, False]
-            ).drop(columns=['is_sym'])
-            final_df = final_df.groupby('s1_id').head(CAND_CAP).reset_index(drop=True)
-            final_df.to_parquet(final_cands_path, index=False)
-            print(f"\nTruncated final candidates to CAND_CAP={CAND_CAP}: "
-                  f"{len(final_df):,} pairs saved to {final_cands_path}", flush=True)
+    elapsed_total = time.time() - start_total_time
+    rss_done = _rss_mb()
+    print(f"\nBlocking complete: {total_pairs_count:,} candidate pairs in {len(existing_chunks)} chunks "
+          f"({elapsed_total:.0f}s, RSS {rss_done:.0f} MB)", flush=True)
 
     # Write done-marker (must be last so resume only skips if truly complete)
     done_marker = os.path.join(cache_dir, f"cands_{args.split}.done")
