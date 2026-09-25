@@ -54,7 +54,6 @@ ADDR_ABBREVIATIONS = {
     "opp": "opposite",
     "nr": "near",
     "bldg": "building",
-    "r": "rue",
     "pl": "place",
     "chs": "society",
     # french words

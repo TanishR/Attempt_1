@@ -24,7 +24,7 @@ def get_args():
     parser.add_argument("--cache-dir", type=str, default=None, help="Directory holding cached parquet and npy files.")
     parser.add_argument("--laptop-test", action="store_true", help="Run on cache/laptop_test isolated small dataset.")
     parser.add_argument("--chunk-size", type=int, default=100000, help="S1 query chunk size for memory-safe processing.")
-    parser.add_argument("--k-channel-a", type=int, default=50, help="Number of nearest neighbors to retrieve per source in Channel A.")
+    parser.add_argument("--k-channel-a", type=int, default=K_PER_SOURCE, help="Number of nearest neighbors to retrieve per source in Channel A.")
     return parser.parse_args()
 
 def load_embedding_arrays(cache_dir, split, source):
