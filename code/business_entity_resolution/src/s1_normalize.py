@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.abspath("code/business_entity_resolution/src"))
 from config import CACHE_DIR
 from maps import (
     NAME_ABBREVIATIONS, LEGAL_SUFFIXES, WEAK_TOKENS, 
-    ADDR_ABBREVIATIONS, UNIT_TOKENS, STATE_MAP
+    ADDR_ABBREVIATIONS, UNIT_TOKENS, STATE_MAP, SHORT_STATE_MAP
 )
 
 def transliterate_if_needed(text):
@@ -171,7 +171,7 @@ def extract_aka_names(raw_name):
             return norm_a, norm_b
     return "", ""
 
-def normalize_address(raw_addr):
+def normalize_address(raw_addr, country=""):
     """
     Normalizes address, strips leading zeros from all numeric tokens,
     extracts house candidates, numeric tokens, zip/pin, and street token.
@@ -266,6 +266,24 @@ def normalize_address(raw_addr):
                 break
         if state_code:
             break
+
+    if not state_code and addr_tokens:
+        last_tok = addr_tokens[-1]
+        first_tok = addr_tokens[0]
+        
+        if country == "France":
+            fr_shorts = {"hdf", "naq", "pdl", "idf", "bre", "nor"}
+            if last_tok in fr_shorts:
+                state_code = last_tok
+            elif first_tok in fr_shorts:
+                state_code = first_tok
+        else:
+            if last_tok in SHORT_STATE_MAP:
+                state_code = SHORT_STATE_MAP[last_tok]
+            elif first_tok in SHORT_STATE_MAP and first_tok not in {"la", "de"}:
+                state_code = SHORT_STATE_MAP[first_tok]
+            elif first_tok in SHORT_STATE_MAP and country in {"US", "India"}:
+                state_code = SHORT_STATE_MAP[first_tok]
             
     addr_missing = 1 if not addr_norm else 0
     
@@ -280,7 +298,7 @@ def process_chunk(df_chunk):
         raw_addr = row.get("business_address", "")
         
         n_full, n_a, n_b, core, legal, c_sorted, skel = normalize_name(raw_name)
-        a_norm, a_unit, h_no, h_mask, num_tok, z_pin, st_code, a_miss, st_tok, h_cands = normalize_address(raw_addr)
+        a_norm, a_unit, h_no, h_mask, num_tok, z_pin, st_code, a_miss, st_tok, h_cands = normalize_address(raw_addr, country=country)
         aka_a, aka_b = extract_aka_names(raw_name)
         
         if not n_full and raw_name and str(raw_name).strip():

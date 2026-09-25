@@ -143,3 +143,11 @@ STATE_MAP = {
     "bretagne": "bre",
     "normandie": "nor"
 }
+
+SHORT_STATE_MAP = {c: c for c in STATE_MAP.values()}
+SHORT_STATE_MAP.update({
+    "ts": "tg",
+    "od": "or",
+    "ua": "uk",
+    "ct": "cg",
+})
