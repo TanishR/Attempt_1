@@ -409,6 +409,19 @@ def main():
     print(f"Cache Directory: {cache_dir}")
     print(f"Total features configured: {len(config.FEATURES)}")
 
+    # 0. For train split, load split.parquet to determine which S1 get features.
+    #    Blocking now runs over ALL S1 (for realistic reverse_rank/Channel D),
+    #    but features are only needed for the sampled train+val S1.
+    sampled_s1_ids = None  # None means "keep all" (test split)
+    if args.split == "train":
+        split_path = os.path.join(cache_dir, "split.parquet")
+        if os.path.exists(split_path):
+            split_df = pd.read_parquet(split_path)
+            sampled_s1_ids = set(split_df['s1_id'].values)
+            print(f"Loaded split.parquet: {len(sampled_s1_ids)} sampled S1 for feature extraction.")
+        else:
+            print("WARNING: split.parquet not found; computing features for ALL S1.")
+
     # 1. Locate candidate files
     chunk_pattern_prefix = f"cands_{args.split}_chunk_"
     chunk_files = []
@@ -487,10 +500,12 @@ def main():
     print("Loading candidate embedding arrays...")
     all_cand_emb, cand_id_map = load_candidate_embeddings(cache_dir, args.split)
 
-    # 5. Compute global reverse rank across all candidate pairs
+    # 5. Compute global reverse rank across ALL candidate pairs (full competition).
+    #    This includes candidates for S1 outside the sample, so reverse_rank
+    #    reflects realistic test-time competition levels.
     chunk_rr_list = compute_global_reverse_ranks(cache_dir, args.split, chunk_files)
 
-    # 6. Process each pending chunk
+    # 6. Process each pending chunk — filter to sampled S1 only (train) or all (test)
     processed_feats = []
     t_feat_start = time.time()
     for idx, cf, out_p1, out_p2 in pending_chunks:
@@ -498,7 +513,21 @@ def main():
         t_ch = time.time()
         chunk_cands = pd.read_parquet(cf)
         chunk_rr = chunk_rr_list[idx]
-        
+
+        # Filter to sampled S1 only (for train split)
+        if sampled_s1_ids is not None:
+            keep_mask = chunk_cands['s1_id'].isin(sampled_s1_ids)
+            n_before = len(chunk_cands)
+            chunk_cands = chunk_cands[keep_mask].reset_index(drop=True)
+            chunk_rr = chunk_rr[keep_mask.values]
+            print(f"  Filtered to sampled S1: {n_before} -> {len(chunk_cands)} candidate pairs")
+
+        if len(chunk_cands) == 0:
+            print(f"  No sampled S1 in this chunk, skipping.")
+            # Write empty file so resume sees it as done
+            pd.DataFrame(columns=['s1_id', 'cand_id']).to_parquet(out_p1, index=False)
+            continue
+
         feats_df = compute_chunk_features(
             chunk_cands, s1_norm, cands_norm, all_cand_emb, cand_id_map, chunk_rr
         )
@@ -520,11 +549,20 @@ def main():
         out_p1 = os.path.join(cache_dir, f"feats_{args.split}_{chunk_suffix}.parquet")
         out_p2 = os.path.join(cache_dir, f"feats_{args.split}_{idx}.parquet")
         target_p = out_p1 if os.path.exists(out_p1) else out_p2
-        all_feats.append(pd.read_parquet(target_p))
-    df_full = pd.concat(all_feats, ignore_index=True)
+        if os.path.exists(target_p):
+            df_chunk = pd.read_parquet(target_p)
+            if len(df_chunk) > 0:
+                all_feats.append(df_chunk)
+    if all_feats:
+        df_full = pd.concat(all_feats, ignore_index=True)
+    else:
+        df_full = pd.DataFrame()
 
     # Acceptance report
-    print_acceptance_report(df_full, elapsed_time=t_feat_total)
+    if len(df_full) > 0:
+        print_acceptance_report(df_full, elapsed_time=t_feat_total)
+    else:
+        print("No feature rows produced.")
 
 if __name__ == "__main__":
     main()
