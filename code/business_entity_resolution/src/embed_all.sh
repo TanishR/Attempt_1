@@ -3,8 +3,8 @@ set -e
 
 SPLIT_FILE="cache/split.parquet"
 
-echo "Embedding Train Source 1..."
-python3 code/business_entity_resolution/src/s2_embed.py --split train --source s1 --ids-file $SPLIT_FILE
+echo "Embedding Train Source 1 (ALL S1 for full blocking competition)..."
+python3 code/business_entity_resolution/src/s2_embed.py --split train --source s1 --all-s1
 
 echo "Embedding Train Source 2..."
 python3 code/business_entity_resolution/src/s2_embed.py --split train --source s2

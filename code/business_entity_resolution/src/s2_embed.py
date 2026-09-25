@@ -20,6 +20,7 @@ def get_args():
     parser.add_argument("--split", type=str, required=True, choices=["train", "test"], help="Dataset split.")
     parser.add_argument("--source", type=str, required=True, choices=["source1", "source2", "source3", "s1", "s2", "s3"], help="Data source.")
     parser.add_argument("--ids-file", type=str, default=None, help="Optional parquet file with entity_ids to filter.")
+    parser.add_argument("--all-s1", action="store_true", help="Embed ALL train S1 (ignore --ids-file filter). Fixes train/test distribution shift.")
     parser.add_argument("--benchmark", action="store_true", help="Run benchmark on random 50k unique names and exit.")
     return parser.parse_args()
 
@@ -143,7 +144,9 @@ def main():
     print(f"Loading {file_path}...")
     df = pd.read_parquet(file_path)
 
-    if args.ids_file:
+    if args.all_s1:
+        print("--all-s1 set: embedding ALL S1 records (ignoring --ids-file filter).")
+    elif args.ids_file:
         print(f"Filtering using IDs from {args.ids_file}...")
         ids_df = pd.read_parquet(args.ids_file)
         if 'source1_entity_id' in ids_df.columns:
