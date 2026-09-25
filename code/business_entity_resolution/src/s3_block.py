@@ -609,6 +609,9 @@ def main():
             print(f"Loaded ground truth: {len(gt_df)} rows")
 
     # Partition S1 into chunks of args.chunk_size (100k queries) with resume
+    # NOTE: For split=train, this is ALL S1 from the norm file (not just the sampled
+    # train/val split). This ensures Channel D, reverse_rank and exclusivity see
+    # realistic competition matching the test-time distribution.
     all_s1_ids = s1_keys_df['entity_id'].values
     chunk_size = args.chunk_size
     num_chunks = (len(all_s1_ids) + chunk_size - 1) // chunk_size
