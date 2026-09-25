@@ -23,17 +23,59 @@ def _rss_mb() -> float:
     return -1.0
 
 
-def _id_to_int(series: pd.Series) -> pd.Series:
-    """
+def _id_to_int(series: pd.Series, validate: bool = True) -> pd.Series:
+    r"""
     Converts 'S1-12345', 'S2-12345', 'S3-12345' style IDs to int64.
-    Source prefix is encoded as the top 2 decimal digits: S1->10^12, S2->2*10^12, S3->3*10^12.
-    Falls back to pandas Categorical codes if the format is unexpected.
+    Encoding: source_digit × 10^12 + numeric_part
+      S1-12345 → 1_000_000_012_345
+      S2-12345 → 2_000_000_012_345
+      S3-12345 → 3_000_000_012_345
+    Guarantees no collision between S1/S2/S3 because numeric_part < 10^12.
+
+    Hard assertions (per chunk):
+      1. Every raw ID matches ^S[123]-\d+$
+      2. Numeric part < 10^12
+      3. No two distinct raw IDs map to the same int64 (raw nunique == enc nunique)
+    Fails loudly with AssertionError if any check is violated.
     """
+    if series.empty:
+        return pd.Series([], dtype=np.int64)
+
     s = series.astype(str)
-    # Determine prefix multiplier from first char after 'S'
+
+    if validate:
+        valid_mask = s.str.match(r'^S[123]-\d+$')
+        if not valid_mask.all():
+            bad = s[~valid_mask]
+            raise AssertionError(
+                f"_id_to_int assertion failed: {len(bad)} raw IDs do not match ^S[123]-\\d+$. "
+                f"First bad ID: {bad.iloc[0]!r}"
+            )
+
     prefix = s.str[1].map({'1': 1_000_000_000_000, '2': 2_000_000_000_000, '3': 3_000_000_000_000})
     numeric = s.str.split('-', n=1).str[1].astype(np.int64)
-    return (prefix.fillna(0).astype(np.int64) + numeric)
+
+    if validate:
+        if not (numeric < 1_000_000_000_000).all():
+            big = numeric[numeric >= 1_000_000_000_000]
+            raise AssertionError(
+                f"_id_to_int assertion failed: {len(big)} numeric parts >= 10^12. "
+                f"First offender: numeric={big.iloc[0]}"
+            )
+
+    encoded = prefix.astype(np.int64) + numeric
+
+    if validate:
+        n_raw = series.nunique()
+        n_enc = encoded.nunique()
+        if n_raw != n_enc:
+            raise AssertionError(
+                f"_id_to_int assertion failed: collision detected! "
+                f"Raw nunique ({n_raw}) != encoded nunique ({n_enc}) for this chunk."
+            )
+
+    return encoded
+
 
 
 def parse_args():
@@ -363,13 +405,15 @@ def compute_global_reverse_ranks(cache_dir, split, chunk_files, sampled_s1_ids=N
         df = pd.read_parquet(cf, columns=['s1_id', 'cand_id', 'emb_score'])
         chunk_lens.append(len(df))
         # Convert string IDs to int64 (strips 'S1-' etc.) — ~4× smaller than object dtype
-        df['s1_int'] = _id_to_int(df['s1_id'])
-        df['cid_int'] = _id_to_int(df['cand_id'])
+        # Hard assertion checks run on every chunk: regex, range (< 10^12), nunique collision
+        df['s1_int'] = _id_to_int(df['s1_id'], validate=True)
+        df['cid_int'] = _id_to_int(df['cand_id'], validate=True)
         df = df.drop(columns=['s1_id', 'cand_id'])
         int_chunk_dfs.append(df)
         rss = _rss_mb()
         print(f"  [reverse_rank] Read chunk {ci + 1}/{len(chunk_files)}: {len(df):,} rows  "
               f"(RSS {rss:.0f} MB)", flush=True)
+
 
     # --- Concatenate int64 frames and rank globally ---
     print(f"  Concatenating {len(int_chunk_dfs)} int64 frames ({sum(chunk_lens):,} rows)...", flush=True)
@@ -518,13 +562,12 @@ def main():
             chunk_files.append(os.path.join(cache_dir, f))
 
     if not chunk_files:
-        # Fallback to single cands_{split}.parquet if chunks not found
-        single_cands_path = os.path.join(cache_dir, f"cands_{args.split}.parquet")
-        if os.path.exists(single_cands_path):
-            chunk_files = [single_cands_path]
-        else:
-            print(f"Error: No candidate files found in {cache_dir} for split {args.split}.")
-            sys.exit(1)
+        raise FileNotFoundError(
+            f"No candidate chunk files (cands_{args.split}_chunk_*.parquet) found in '{cache_dir}'. "
+            f"Run s3_block.py --split {args.split} first. "
+            f"The old single-file fallback (cands_{args.split}.parquet) has been removed "
+            f"because it required a 9-crore-row concat that caused OOM on EC2."
+        )
 
     print(f"Found {len(chunk_files)} candidate chunk file(s).")
 

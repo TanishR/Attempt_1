@@ -18,6 +18,19 @@ import pandas as pd
 
 import config
 
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
+
+def _rss_mb() -> float:
+    """Returns current process RSS in MB, or -1 if psutil unavailable."""
+    if _HAS_PSUTIL:
+        return psutil.Process(os.getpid()).memory_info().rss / 1_048_576
+    return -1.0
+
 
 def parse_args():
     """
@@ -325,14 +338,56 @@ def main():
     for sid, mstr in zip(pred_df["s1_id"].values, pred_df["matched_ids"].values):
         match_map[sid] = [x.strip() for x in str(mstr).split(",") if x.strip()]
 
-    # 3. Load candidate pairs (all pairs scored by model)
-    probs_path = os.path.join(cache_dir, f"{args.split}_probs.parquet")
-    if not os.path.exists(probs_path):
-        raise FileNotFoundError(f"Missing {probs_path}. Run s7_predict.py first.")
+    # 3. Load candidate pairs per chunk (all pairs scored by model)
+    # Reads chunk files one by one to avoid building a 9-crore row string DataFrame in memory.
+    split_for_cands = "train" if (args.laptop_test and args.split == "test") else args.split
+    chunk_files = []
 
-    probs_df = pd.read_parquet(probs_path, columns=["s1_id", "cand_id"])
-    print(f"Grouping candidate pairs across {len(probs_df):,} rows...")
-    cand_map: Dict[str, List[str]] = probs_df.groupby("s1_id")["cand_id"].agg(list).to_dict()
+    # Check cands_{split}_chunk_*.parquet first
+    for f in sorted(os.listdir(cache_dir)):
+        if f.startswith(f"cands_{split_for_cands}_chunk_") and f.endswith(".parquet"):
+            chunk_files.append(os.path.join(cache_dir, f))
+
+    # If not found, check feats_{split}_chunk_*.parquet
+    if not chunk_files:
+        for f in sorted(os.listdir(cache_dir)):
+            if f.startswith(f"feats_{split_for_cands}_chunk_") and f.endswith(".parquet"):
+                chunk_files.append(os.path.join(cache_dir, f))
+
+    if not chunk_files:
+        raise FileNotFoundError(
+            f"No candidate chunk files (cands_{split_for_cands}_chunk_*.parquet or feats_{split_for_cands}_chunk_*.parquet) "
+            f"found in '{cache_dir}'. Ensure blocking (Stage 7) or feature extraction (Stage 8) was run."
+        )
+
+    print(f"Reading candidate pairs chunk-by-chunk across {len(chunk_files)} chunk file(s)...", flush=True)
+    filter_s1_set = set(s1_order) if (args.laptop_test and args.split == "test") else None
+
+    cand_map: Dict[str, List[str]] = {}
+    total_pairs_loaded = 0
+    for ci, cf in enumerate(chunk_files):
+        t_cf = time.time()
+        cdf = pd.read_parquet(cf, columns=["s1_id", "cand_id"])
+        if filter_s1_set is not None:
+            cdf = cdf[cdf["s1_id"].isin(filter_s1_set)]
+
+        # Group candidates for this chunk without building a global string DataFrame
+        for sid, grp in cdf.groupby("s1_id", sort=False):
+            c_ids = list(dict.fromkeys(grp["cand_id"].values))
+            if sid in cand_map:
+                cand_map[sid].extend(c_ids)
+                cand_map[sid] = list(dict.fromkeys(cand_map[sid]))
+            else:
+                cand_map[sid] = c_ids
+
+        total_pairs_loaded += len(cdf)
+        del cdf
+        import gc; gc.collect()
+        rss = _rss_mb()
+        print(f"  [candidate_pairs] Read chunk {ci + 1}/{len(chunk_files)}: {os.path.basename(cf)}  "
+              f"(accumulated {len(cand_map):,} S1 entities, RSS {rss:.0f} MB)", flush=True)
+
+    print(f"Loaded candidate pairs for {len(cand_map):,} total S1 entities ({total_pairs_loaded:,} pairs, RSS {_rss_mb():.0f} MB).", flush=True)
 
     # 4. Write matching_results.tsv and candidate_pairs.tsv
     matching_tsv = os.path.join(args.output_dir, "matching_results.tsv")
