@@ -8,6 +8,9 @@ sys.path.append('.')
 from config import CACHE_DIR, SEED, SAMPLE
 
 def create_split():
+    if os.path.exists(os.path.join(CACHE_DIR, "split.parquet")):
+        print("split.parquet already exists. Skipping creation.")
+        return
     s1_path = os.path.join(CACHE_DIR, "raw_train_source1.parquet")
     if not os.path.exists(s1_path): return
     s1_df = pd.read_parquet(s1_path, columns=["entity_id"])
