@@ -33,9 +33,9 @@ BLOCK_BY_COUNTRY = True
 EMB_DIM = 256
 EMB_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
-T_TOP1 = None
-T_EXTRA = None
-EXCL_MARGIN = 0.0
+T_TOP1 = 0.48
+T_EXTRA = 0.68
+EXCL_MARGIN = 0.05
 FEATURES = [
     # Embedding & Rank
     "emb_score",

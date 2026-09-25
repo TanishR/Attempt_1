@@ -7,11 +7,16 @@ from typing import Dict, Set, Iterable
 import pandas as pd
 
 
-def f05_entity(pred: Set[str], gold: Set[str]) -> float:
+def f05_entity(pred, gold) -> float:
     """
     Computes entity-level F0.5 score for a single entity.
     Returns: float F0.5 score in [0.0, 1.0].
     """
+    if not isinstance(gold, set):
+        gold = set(gold)
+    if not isinstance(pred, set):
+        pred = set(pred)
+
     if not gold:                       # true singleton
         return 1.0 if not pred else 0.0
     if not pred:                       # had matches, predicted nothing
