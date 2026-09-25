@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import re
 import argparse
 from collections import defaultdict, Counter
 import numpy as np
@@ -713,11 +714,9 @@ def print_acceptance_report(chunk_files, cache_dir, split, elapsed_time):
     target_paths = []
     for idx, cf in enumerate(chunk_files):
         chunk_suffix = os.path.basename(cf).replace(f"cands_{split}_", "").replace(".parquet", "")
-        out_p1 = os.path.join(cache_dir, f"feats_{split}_{chunk_suffix}.parquet")
-        out_p2 = os.path.join(cache_dir, f"feats_{split}_{idx}.parquet")
-        target_p = out_p1 if os.path.exists(out_p1) else out_p2
-        if os.path.exists(target_p):
-            target_paths.append(target_p)
+        out_p = os.path.join(cache_dir, f"feats_{split}_{chunk_suffix}.parquet")
+        if os.path.exists(out_p):
+            target_paths.append(out_p)
 
     if not target_paths:
         print("No feature rows produced.")
@@ -876,10 +875,14 @@ def main():
 
     # 1. Locate candidate files
     chunk_pattern_prefix = f"cands_{args.split}_chunk_"
-    chunk_files = []
-    for f in sorted(os.listdir(cache_dir)):
-        if f.startswith(chunk_pattern_prefix) and f.endswith(".parquet"):
-            chunk_files.append(os.path.join(cache_dir, f))
+    raw_files = [f for f in os.listdir(cache_dir) if f.startswith(chunk_pattern_prefix) and f.endswith(".parquet")]
+    chunk_files = [
+        os.path.join(cache_dir, f)
+        for f in sorted(
+            raw_files,
+            key=lambda x: int(re.search(r"chunk_(\d+)", x).group(1)) if re.search(r"chunk_(\d+)", x) else x
+        )
+    ]
 
     if not chunk_files:
         raise FileNotFoundError(
@@ -922,15 +925,13 @@ def main():
     pending_chunks = []
     for idx, cf in enumerate(chunk_files):
         chunk_suffix = os.path.basename(cf).replace(f"cands_{args.split}_", "").replace(".parquet", "")
-        out_name1 = f"feats_{args.split}_{chunk_suffix}.parquet"
-        out_name2 = f"feats_{args.split}_{idx}.parquet"
-        out_p1 = os.path.join(cache_dir, out_name1)
-        out_p2 = os.path.join(cache_dir, out_name2)
+        out_name = f"feats_{args.split}_{chunk_suffix}.parquet"
+        out_p = os.path.join(cache_dir, out_name)
 
-        if (os.path.exists(out_p1) or os.path.exists(out_p2)) and not args.force:
-            print(f"Chunk {idx + 1}/{len(chunk_files)} already processed, skipping.")
+        if os.path.exists(out_p) and not args.force:
+            print(f"Chunk {idx + 1}/{len(chunk_files)} ({out_name}) already processed, skipping.")
         else:
-            pending_chunks.append((idx, cf, out_p1, out_p2))
+            pending_chunks.append((idx, cf, out_p))
 
     if not pending_chunks:
         print("\nAll feature chunks already computed. Loading results for acceptance checks...")
@@ -1003,8 +1004,9 @@ def main():
     #    emb_score across all 40 candidates, n_cands should be 40, and support
     #    depends on the top-5 candidates by emb_score.
     t_feat_start = time.time()
-    for idx, cf, out_p1, out_p2 in pending_chunks:
-        print(f"\nProcessing chunk {idx + 1}/{len(chunk_files)}: {cf}...", flush=True)
+    for idx, cf, out_p in pending_chunks:
+        cf_basename = os.path.basename(cf)
+        print(f"\nProcessing chunk {idx + 1}/{len(chunk_files)}: {cf_basename}...", flush=True)
         t_ch = time.time()
         chunk_full = pd.read_parquet(cf)
         chunk_rr = chunk_rr_list[idx]
@@ -1017,10 +1019,8 @@ def main():
         kept_s1_set = set(chunk_full.loc[keep_mask, 's1_id'].unique())
 
         if not kept_s1_set:
-            print(f"  No sampled/competitor S1 in this chunk, saving empty frame.")
-            pd.DataFrame(columns=['s1_id', 'cand_id']).to_parquet(out_p1, index=False)
-            if out_p1 != out_p2:
-                pd.DataFrame(columns=['s1_id', 'cand_id']).to_parquet(out_p2, index=False)
+            print(f"  No sampled/competitor S1 in this chunk, saving empty frame to {out_p}.")
+            pd.DataFrame(columns=['s1_id', 'cand_id']).to_parquet(out_p, index=False)
             chunk_rr_list[idx] = None
             chunk_keep_masks[idx] = None
             chunk_is_comps[idx] = None
@@ -1060,9 +1060,7 @@ def main():
             kept_rr, df_tokens, kept_gap, kept_nc, kept_sup
         )
 
-        feats_df.to_parquet(out_p1, index=False)
-        if out_p1 != out_p2:
-            feats_df.to_parquet(out_p2, index=False)
+        feats_df.to_parquet(out_p, index=False)
 
         # Free this chunk's reverse rank and masks immediately
         chunk_rr_list[idx] = None
@@ -1070,7 +1068,7 @@ def main():
         chunk_is_comps[idx] = None
 
         rss_aft = _rss_mb()
-        print(f"Saved chunk {idx + 1} features ({len(feats_df):,} pairs) to {out_p1} "
+        print(f"Saved chunk {idx + 1}/{len(chunk_files)} features ({len(feats_df):,} pairs) to {out_p} "
               f"in {time.time() - t_ch:.2f}s  (RSS {rss_aft:.0f} MB)", flush=True)
 
         del chunk_full, context_mask, kept_df, kept_gap, kept_nc, kept_sup, feats_df

@@ -74,34 +74,51 @@ def load_val_probabilities(cache_dir: str, version: str) -> pd.DataFrame:
 
     # Merge emb_score if not present for tie-breaking
     if "emb_score" not in probs_df.columns:
-        feat_files = []
-        for f in sorted(os.listdir(cache_dir)):
-            if f.startswith("feats_train_chunk_") and f.endswith(".parquet"):
-                feat_files.append(os.path.join(cache_dir, f))
-        if not feat_files:
-            for f in sorted(os.listdir(cache_dir)):
-                if f.startswith("feats_train_") and f.endswith(".parquet"):
-                    feat_files.append(os.path.join(cache_dir, f))
+        cand_chunks = [f for f in os.listdir(cache_dir) if f.startswith("cands_train_chunk_") and f.endswith(".parquet")]
+        expected_chunks = len(cand_chunks)
 
-        if feat_files:
-            print("Merging emb_score from feature files for exact tie-breaking...")
-            val_s1_set = set(probs_df["s1_id"].unique())
-            emb_chunks = []
-            for fp in feat_files:
-                cdf = pd.read_parquet(fp, columns=["s1_id", "cand_id", "emb_score"])
-                # Convert IDs to int64
-                if cdf["s1_id"].dtype == object or isinstance(cdf["s1_id"].iloc[0], str):
-                    cdf["s1_id"] = _id_to_int(cdf["s1_id"], validate=False)
-                # Keep only val/competitor S1 rows to avoid keeping train rows in memory
-                cdf = cdf[cdf["s1_id"].isin(val_s1_set)]
-                if len(cdf) > 0:
-                    if cdf["cand_id"].dtype == object or isinstance(cdf["cand_id"].iloc[0], str):
-                        cdf["cand_id"] = _id_to_int(cdf["cand_id"], validate=False)
-                    cdf["emb_score"] = cdf["emb_score"].astype(np.float32)
-                    emb_chunks.append(cdf)
-            if emb_chunks:
-                all_emb_df = pd.concat(emb_chunks, ignore_index=True).drop_duplicates(subset=["s1_id", "cand_id"])
-                probs_df = probs_df.merge(all_emb_df, on=["s1_id", "cand_id"], how="left")
+        feat_files = []
+        chunk_prefix = "feats_train_chunk_"
+        for f in os.listdir(cache_dir):
+            if f.startswith(chunk_prefix) and f.endswith(".parquet"):
+                feat_files.append(os.path.join(cache_dir, f))
+
+        if not feat_files:
+            raise FileNotFoundError(
+                f"No feature files found matching 'feats_train_chunk_*.parquet' in '{cache_dir}'. "
+                f"Run s4_features.py --split train first."
+            )
+
+        if expected_chunks > 0 and len(feat_files) < expected_chunks:
+            raise RuntimeError(
+                f"Incomplete feature chunks in '{cache_dir}': found {len(feat_files)} file(s) matching "
+                f"'feats_train_chunk_*.parquet', but expected {expected_chunks} (matching cands_train_chunk_*.parquet). "
+                f"Run s4_features.py --split train to complete feature extraction."
+            )
+
+        feat_files = sorted(
+            feat_files,
+            key=lambda x: int(re.search(r"chunk_(\d+)", os.path.basename(x)).group(1)) if re.search(r"chunk_(\d+)", os.path.basename(x)) else x
+        )
+
+        print("Merging emb_score from feature files for exact tie-breaking...")
+        val_s1_set = set(probs_df["s1_id"].unique())
+        emb_chunks = []
+        for fp in feat_files:
+            cdf = pd.read_parquet(fp, columns=["s1_id", "cand_id", "emb_score"])
+            # Convert IDs to int64
+            if cdf["s1_id"].dtype == object or isinstance(cdf["s1_id"].iloc[0], str):
+                cdf["s1_id"] = _id_to_int(cdf["s1_id"], validate=False)
+            # Keep only val/competitor S1 rows to avoid keeping train rows in memory
+            cdf = cdf[cdf["s1_id"].isin(val_s1_set)]
+            if len(cdf) > 0:
+                if cdf["cand_id"].dtype == object or isinstance(cdf["cand_id"].iloc[0], str):
+                    cdf["cand_id"] = _id_to_int(cdf["cand_id"], validate=False)
+                cdf["emb_score"] = cdf["emb_score"].astype(np.float32)
+                emb_chunks.append(cdf)
+        if emb_chunks:
+            all_emb_df = pd.concat(emb_chunks, ignore_index=True).drop_duplicates(subset=["s1_id", "cand_id"])
+            probs_df = probs_df.merge(all_emb_df, on=["s1_id", "cand_id"], how="left")
 
     # Keep only needed columns with minimal dtypes (int64, float32, int8)
     probs_df["s1_id"] = probs_df["s1_id"].astype(np.int64)
@@ -458,14 +475,32 @@ def print_worst_diagnostics(
     for s1, c, _ in misses[:limit]:
         needed_pairs.add((s1, c))
 
+    cand_chunks = [f for f in os.listdir(cache_dir) if f.startswith("cands_train_chunk_") and f.endswith(".parquet")]
+    expected_chunks = len(cand_chunks)
+
     feat_files = []
-    for f in sorted(os.listdir(cache_dir)):
-        if f.startswith("feats_train_chunk_") and f.endswith(".parquet"):
+    chunk_prefix = "feats_train_chunk_"
+    for f in os.listdir(cache_dir):
+        if f.startswith(chunk_prefix) and f.endswith(".parquet"):
             feat_files.append(os.path.join(cache_dir, f))
+
     if not feat_files:
-        for f in sorted(os.listdir(cache_dir)):
-            if f.startswith("feats_train_") and f.endswith(".parquet"):
-                feat_files.append(os.path.join(cache_dir, f))
+        raise FileNotFoundError(
+            f"No feature files found matching 'feats_train_chunk_*.parquet' in '{cache_dir}'. "
+            f"Run s4_features.py --split train first."
+        )
+
+    if expected_chunks > 0 and len(feat_files) < expected_chunks:
+        raise RuntimeError(
+            f"Incomplete feature chunks in '{cache_dir}': found {len(feat_files)} file(s) matching "
+            f"'feats_train_chunk_*.parquet', but expected {expected_chunks} (matching cands_train_chunk_*.parquet). "
+            f"Run s4_features.py --split train to complete feature extraction."
+        )
+
+    feat_files = sorted(
+        feat_files,
+        key=lambda x: int(re.search(r"chunk_(\d+)", os.path.basename(x)).group(1)) if re.search(r"chunk_(\d+)", os.path.basename(x)) else x
+    )
 
     feat_lookup = {}
     if feat_files and needed_pairs:

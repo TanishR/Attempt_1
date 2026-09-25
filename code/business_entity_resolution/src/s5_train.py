@@ -9,6 +9,7 @@ import argparse
 import os
 import sys
 import time
+import re
 from datetime import datetime
 from typing import Dict, List, Set, Tuple
 
@@ -37,28 +38,39 @@ def parse_args():
 def load_dataset_features(cache_dir: str) -> pd.DataFrame:
     """
     Loads all train candidate feature parquet files from cache.
+    Unified naming pattern: feats_train_chunk_*.parquet
+    Raises FileNotFoundError if 0 files found.
+    Raises RuntimeError if fewer files found than expected candidate chunks.
     Returns: concatenated DataFrame of candidate pairs with features.
     """
+    cand_chunks = [f for f in os.listdir(cache_dir) if f.startswith("cands_train_chunk_") and f.endswith(".parquet")]
+    expected_chunks = len(cand_chunks)
+
     feat_files = []
     chunk_prefix = "feats_train_chunk_"
-    for f in sorted(os.listdir(cache_dir)):
+    for f in os.listdir(cache_dir):
         if f.startswith(chunk_prefix) and f.endswith(".parquet"):
             feat_files.append(os.path.join(cache_dir, f))
 
     if not feat_files:
-        prefix = "feats_train_"
-        for f in sorted(os.listdir(cache_dir)):
-            if f.startswith(prefix) and f.endswith(".parquet"):
-                feat_files.append(os.path.join(cache_dir, f))
+        raise FileNotFoundError(
+            f"No feature files found matching 'feats_train_chunk_*.parquet' in '{cache_dir}'. "
+            f"Expected {expected_chunks} chunks. Run s4_features.py --split train first."
+        )
 
-    if not feat_files:
-        single_path = os.path.join(cache_dir, "feats_train.parquet")
-        if os.path.exists(single_path):
-            feat_files = [single_path]
-        else:
-            raise FileNotFoundError(f"No feats_train_*.parquet files found in {cache_dir}")
+    if expected_chunks > 0 and len(feat_files) < expected_chunks:
+        raise RuntimeError(
+            f"Incomplete feature chunks in '{cache_dir}': found {len(feat_files)} file(s) matching "
+            f"'feats_train_chunk_*.parquet', but expected {expected_chunks} (matching cands_train_chunk_*.parquet). "
+            f"Run s4_features.py --split train to complete feature extraction."
+        )
 
-    print(f"Loading features from {len(feat_files)} file(s)...")
+    feat_files = sorted(
+        feat_files,
+        key=lambda x: int(re.search(r"chunk_(\d+)", os.path.basename(x)).group(1)) if re.search(r"chunk_(\d+)", os.path.basename(x)) else x
+    )
+
+    print(f"Loading features from {len(feat_files)} file(s) (expected {expected_chunks})...")
     dfs = [pd.read_parquet(fp) for fp in feat_files]
     full_df = pd.concat(dfs, ignore_index=True)
     print(f"Loaded {len(full_df):,} total feature pairs.")

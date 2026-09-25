@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import re
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -342,24 +343,22 @@ def main():
     # 3. Load candidate pairs per chunk (all pairs scored by model)
     # Reads chunk files one by one to avoid building a 9-crore row string DataFrame in memory.
     split_for_cands = "train" if (args.laptop_test and args.split == "test") else args.split
+    cand_prefix = f"cands_{split_for_cands}_chunk_"
     chunk_files = []
-
-    # Check cands_{split}_chunk_*.parquet first
-    for f in sorted(os.listdir(cache_dir)):
-        if f.startswith(f"cands_{split_for_cands}_chunk_") and f.endswith(".parquet"):
+    for f in os.listdir(cache_dir):
+        if f.startswith(cand_prefix) and f.endswith(".parquet"):
             chunk_files.append(os.path.join(cache_dir, f))
-
-    # If not found, check feats_{split}_chunk_*.parquet
-    if not chunk_files:
-        for f in sorted(os.listdir(cache_dir)):
-            if f.startswith(f"feats_{split_for_cands}_chunk_") and f.endswith(".parquet"):
-                chunk_files.append(os.path.join(cache_dir, f))
 
     if not chunk_files:
         raise FileNotFoundError(
-            f"No candidate chunk files (cands_{split_for_cands}_chunk_*.parquet or feats_{split_for_cands}_chunk_*.parquet) "
-            f"found in '{cache_dir}'. Ensure blocking (Stage 7) or feature extraction (Stage 8) was run."
+            f"No candidate chunk files found matching '{cand_prefix}*.parquet' in '{cache_dir}'. "
+            f"Run candidate blocking (Stage 3/7) first."
         )
+
+    chunk_files = sorted(
+        chunk_files,
+        key=lambda x: int(re.search(r"chunk_(\d+)", os.path.basename(x)).group(1)) if re.search(r"chunk_(\d+)", os.path.basename(x)) else x
+    )
 
     print(f"Reading candidate pairs chunk-by-chunk across {len(chunk_files)} chunk file(s)...", flush=True)
     filter_s1_set = set(s1_order) if (args.laptop_test and args.split == "test") else None

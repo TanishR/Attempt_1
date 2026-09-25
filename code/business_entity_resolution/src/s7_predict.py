@@ -9,6 +9,7 @@ import argparse
 import os
 import sys
 import time
+import re
 from typing import Dict, List, Optional, Set
 
 import lightgbm as lgb
@@ -83,24 +84,38 @@ def load_model(cache_dir: str, version: str, explicit_path: Optional[str] = None
 def locate_feature_files(cache_dir: str, split: str) -> List[str]:
     """
     Locates feature chunk parquet files for the given split.
-    Returns: list of feature file paths.
+    Unified naming pattern: feats_{split}_chunk_*.parquet
+    Raises FileNotFoundError if 0 files found.
+    Raises RuntimeError if fewer files found than expected candidate chunks.
+    Returns: list of feature file paths sorted naturally by chunk index.
     """
+    cand_prefix = f"cands_{split}_chunk_"
+    cand_chunks = [f for f in os.listdir(cache_dir) if f.startswith(cand_prefix) and f.endswith(".parquet")]
+    expected_chunks = len(cand_chunks)
+
     feat_files = []
     chunk_prefix = f"feats_{split}_chunk_"
-    for f in sorted(os.listdir(cache_dir)):
+    for f in os.listdir(cache_dir):
         if f.startswith(chunk_prefix) and f.endswith(".parquet"):
             feat_files.append(os.path.join(cache_dir, f))
 
     if not feat_files:
-        prefix = f"feats_{split}_"
-        for f in sorted(os.listdir(cache_dir)):
-            if f.startswith(prefix) and f.endswith(".parquet") and not f.endswith("_probs.parquet"):
-                feat_files.append(os.path.join(cache_dir, f))
+        raise FileNotFoundError(
+            f"No feature files found matching '{chunk_prefix}*.parquet' in '{cache_dir}'. "
+            f"Expected {expected_chunks} chunks. Run s4_features.py --split {split} first."
+        )
 
-    if not feat_files:
-        single_path = os.path.join(cache_dir, f"feats_{split}.parquet")
-        if os.path.exists(single_path):
-            feat_files = [single_path]
+    if expected_chunks > 0 and len(feat_files) < expected_chunks:
+        raise RuntimeError(
+            f"Incomplete feature chunks in '{cache_dir}': found {len(feat_files)} file(s) matching "
+            f"'{chunk_prefix}*.parquet', but expected {expected_chunks} (matching {cand_prefix}*.parquet). "
+            f"Run s4_features.py --split {split} to complete feature extraction."
+        )
+
+    feat_files = sorted(
+        feat_files,
+        key=lambda x: int(re.search(r"chunk_(\d+)", os.path.basename(x)).group(1)) if re.search(r"chunk_(\d+)", os.path.basename(x)) else x
+    )
 
     return feat_files
 
