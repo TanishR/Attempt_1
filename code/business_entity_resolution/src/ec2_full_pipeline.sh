@@ -80,10 +80,11 @@ run_stage() {
             echo "[SKIPPED] Stage ${stage_num}: ${stage_desc} (before from-stage ${FROM_STAGE})"
             return 0
         fi
-        if [ -f "${marker_file}" ] && [ "${FORCE_RUN}" = false ]; then
-            echo "[DONE-MARKER] Stage ${stage_num}: ${stage_desc} already completed. (Skipping, marker exists: ${marker_file})"
-            return 0
-        fi
+    fi
+
+    if [ -f "${marker_file}" ] && [ "${FORCE_RUN}" = false ]; then
+        echo "[DONE-MARKER] Stage ${stage_num}: ${stage_desc} already completed. (Skipping, marker exists: ${marker_file})"
+        return 0
     fi
 
     echo ""
@@ -125,11 +126,8 @@ run_stage 1 "Normalize all entities (Train & Test) with safety validation" "
     echo 'Running pre-normalization safety snapshot...'
     ${PYTHON_BIN} ${SCRIPT_DIR}/safety_check_norm.py --snapshot --cache-dir cache
     
-    echo 'Normalizing train split...'
-    ${PYTHON_BIN} ${SCRIPT_DIR}/s1_normalize.py --split train
-    
-    echo 'Normalizing test split...'
-    ${PYTHON_BIN} ${SCRIPT_DIR}/s1_normalize.py --split test
+    echo 'Normalizing all entities (train and test splits)...'
+    ${PYTHON_BIN} ${SCRIPT_DIR}/s1_normalize.py
     
     echo 'Running post-normalization safety equivalence check...'
     ${PYTHON_BIN} ${SCRIPT_DIR}/safety_check_norm.py --verify --cache-dir cache
