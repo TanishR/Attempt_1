@@ -280,7 +280,7 @@ def compute_support_feature(chunk_df, all_cand_emb, id_to_row):
     # Sort candidates per S1 by emb_score descending to guarantee top-5 order
     orig_indices = np.arange(n_rows)
     df_sorted = chunk_df[['s1_id', 'cand_id', 'emb_score']].assign(orig_idx=orig_indices).sort_values(
-        ['s1_id', 'emb_score'], ascending=[True, False]
+        ['s1_id', 'emb_score'], ascending=[True, False], kind='stable'
     )
 
     s1_sorted = df_sorted['s1_id'].values
@@ -309,10 +309,38 @@ def compute_support_feature(chunk_df, all_cand_emb, id_to_row):
     return support
 
 
-def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map, global_reverse_rank, df_tokens):
+def compute_context_features(context_df, all_cand_emb, cand_id_map):
+    """
+    Computes per-S1 context features on the FULL candidate list of each S1.
+
+    Per-S1 context features (depend on other candidates of the same S1):
+      - gap_to_best:  max(emb_score for this S1) - emb_score of this pair
+      - n_cands:      number of candidates for this S1
+      - support:      max cosine similarity to top-5 candidates (by emb_score)
+
+    These must be computed BEFORE filtering competitor S1 to only shared pairs,
+    because the full 40-candidate context changes their values.
+
+    Returns: (gap_to_best, n_cands, support) as float32 numpy arrays aligned with context_df.
+    """
+    emb_score = context_df['emb_score'].values.astype(np.float32)
+    s1_best_score = context_df.groupby('s1_id')['emb_score'].transform('max').values.astype(np.float32)
+    gap_to_best = s1_best_score - emb_score
+    n_cands = context_df.groupby('s1_id')['cand_id'].transform('count').values.astype(np.float32)
+    support = compute_support_feature(context_df, all_cand_emb, cand_id_map)
+    return gap_to_best, n_cands, support
+
+
+def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
+                           global_reverse_rank, df_tokens,
+                           ctx_gap_to_best, ctx_n_cands, ctx_support):
     """
     Extracts all 31 features and rule_score for a candidate chunk without row-wise loops.
     Token sets and lengths are computed locally only for rows in this chunk.
+
+    Per-S1 context features (gap_to_best, n_cands, support) are passed in pre-computed
+    from compute_context_features which operates on the FULL candidate list per S1.
+
     Returns: pandas.DataFrame containing entity IDs, label, rule_score, and ordered config.FEATURES.
     """
     n_pairs = len(chunk_df)
@@ -450,16 +478,15 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
     ch_rev = chunk_df.get('ch_rev', pd.Series(0, index=chunk_df.index)).values.astype(np.float32)
     n_channels = (ch_emb + ch_addr + ch_skel + ch_rare + ch_rev).astype(np.float32)
 
-    # 14. Context features: gap_to_best and n_cands per S1
-    s1_best_score = chunk_df.groupby('s1_id')['emb_score'].transform('max').values.astype(np.float32)
-    gap_to_best = s1_best_score - emb_score
-    n_cands = chunk_df.groupby('s1_id')['cand_id'].transform('count').values.astype(np.float32)
+    # 14. Per-S1 context features: precomputed on FULL candidate list per S1
+    gap_to_best = ctx_gap_to_best
+    n_cands = ctx_n_cands
 
     # 15. reverse_rank (passed from global split calculation)
     reverse_rank = global_reverse_rank.astype(np.float32)
 
-    # 16. support
-    support = compute_support_feature(chunk_df, all_cand_emb, cand_id_map)
+    # 16. support (precomputed on FULL candidate list per S1)
+    support = ctx_support
 
     # 17. rule_score: 0.5*max(name_token_sort, core_ratio) + 0.3*addr_token_set + 20*(house_match==1)
     rule_score = (
@@ -578,6 +605,24 @@ def compute_global_reverse_ranks(cache_dir, split, chunk_files, sampled_s1_ids=N
 
     kept_cid_ints = all_int.loc[keep_mask, 'cid_int'].values
     unique_cand_ints = set(np.unique(kept_cid_ints))
+
+    # --- Add top-5 candidate IDs of each competitor S1 to needed set ---
+    # Support computation needs embeddings for the top-5 candidates per S1.
+    # For competitor S1, these top-5 might not be in the kept pairs.
+    n_comp_top5_added = 0
+    if unique_comp_s1_ints:
+        comp_rows = all_int[all_int['s1_int'].isin(unique_comp_s1_ints)]
+        top5_per_comp = (comp_rows
+                         .sort_values(['s1_int', 'emb_score'], ascending=[True, False], kind='stable')
+                         .groupby('s1_int')
+                         .head(5))
+        comp_top5_cids = set(top5_per_comp['cid_int'].values)
+        n_comp_top5_added = len(comp_top5_cids - unique_cand_ints)
+        unique_cand_ints |= comp_top5_cids
+        del comp_rows, top5_per_comp, comp_top5_cids
+        print(f"  Added {n_comp_top5_added:,} top-5 competitor cand IDs to needed set "
+              f"(total: {len(unique_cand_ints):,})", flush=True)
+
     s2_cid_ints = {cid for cid in unique_cand_ints if 2_000_000_000_000 <= cid < 3_000_000_000_000}
     s3_cid_ints = {cid for cid in unique_cand_ints if cid >= 3_000_000_000_000}
 
@@ -592,6 +637,7 @@ def compute_global_reverse_ranks(cache_dir, split, chunk_files, sampled_s1_ids=N
         'unique_s2_cands': len(s2_cid_ints),
         'unique_s3_cands': len(s3_cid_ints),
         'unique_total_cands': len(unique_cand_ints),
+        'comp_top5_cands_added': n_comp_top5_added,
     }
 
     needed_s1_ids = _int_to_id(unique_s1_ints)
@@ -813,34 +859,65 @@ def main():
           f"(RSS {_rss_mb():.0f} MB)", flush=True)
 
     # 8. Process each pending chunk
+    #    Per-S1 context features (gap_to_best, n_cands, support) must be computed
+    #    on the FULL candidate list of each S1 BEFORE filtering competitor S1 down
+    #    to only the shared pairs. This is because gap_to_best depends on the best
+    #    emb_score across all 40 candidates, n_cands should be 40, and support
+    #    depends on the top-5 candidates by emb_score.
     processed_feats = []
     t_feat_start = time.time()
     for idx, cf, out_p1, out_p2 in pending_chunks:
         print(f"\nProcessing chunk {idx + 1}/{len(chunk_files)}: {cf}...", flush=True)
         t_ch = time.time()
-        chunk_cands = pd.read_parquet(cf)
+        chunk_full = pd.read_parquet(cf)
         chunk_rr = chunk_rr_list[idx]
         keep_mask = chunk_keep_masks[idx]
         is_comp = chunk_is_comps[idx]
 
-        n_before = len(chunk_cands)
-        chunk_cands = chunk_cands[keep_mask].reset_index(drop=True)
-        chunk_rr = chunk_rr[keep_mask]
-        chunk_cands['is_competitor'] = is_comp[keep_mask].astype(np.int8)
+        n_before = len(chunk_full)
 
-        print(f"  Filtered: {n_before:,} -> {len(chunk_cands):,} candidate pairs "
-              f"(sampled: {(chunk_cands['is_competitor'] == 0).sum():,}, "
-              f"competitor: {(chunk_cands['is_competitor'] == 1).sum():,})", flush=True)
+        # Identify S1 IDs that have at least one kept row
+        kept_s1_set = set(chunk_full.loc[keep_mask, 's1_id'].unique())
 
-        if len(chunk_cands) == 0:
+        if not kept_s1_set:
             print(f"  No sampled/competitor S1 in this chunk, saving empty frame.")
             pd.DataFrame(columns=['s1_id', 'cand_id']).to_parquet(out_p1, index=False)
             if out_p1 != out_p2:
                 pd.DataFrame(columns=['s1_id', 'cand_id']).to_parquet(out_p2, index=False)
             continue
 
+        # Context: ALL rows for S1 IDs that have any kept row
+        # This gives us the full 40-candidate list for competitor S1
+        context_mask = chunk_full['s1_id'].isin(kept_s1_set).values
+        context_df = chunk_full[context_mask].reset_index(drop=True)
+
+        # Compute per-S1 context features on full candidate lists
+        ctx_gap, ctx_nc, ctx_sup = compute_context_features(
+            context_df, all_cand_emb, cand_id_map
+        )
+
+        # Map keep_mask from full chunk to context rows
+        keep_in_context = keep_mask[context_mask]
+
+        # Filter context to only kept rows
+        kept_df = context_df[keep_in_context].reset_index(drop=True)
+        kept_rr = chunk_rr[keep_mask]
+        kept_df['is_competitor'] = is_comp[keep_mask].astype(np.int8)
+
+        # Slice context features to only kept rows
+        kept_gap = ctx_gap[keep_in_context]
+        kept_nc = ctx_nc[keep_in_context]
+        kept_sup = ctx_sup[keep_in_context]
+        del context_df, ctx_gap, ctx_nc, ctx_sup
+
+        n_sampled = int((kept_df['is_competitor'] == 0).sum())
+        n_comp = int((kept_df['is_competitor'] == 1).sum())
+        print(f"  Context: {n_before:,} -> {context_mask.sum():,} rows (full S1 lists), "
+              f"kept: {len(kept_df):,} (sampled: {n_sampled:,}, competitor: {n_comp:,})", flush=True)
+
         feats_df = compute_chunk_features(
-            chunk_cands, s1_norm, cands_norm, all_cand_emb, cand_id_map, chunk_rr, df_tokens
+            kept_df, s1_norm, cands_norm, all_cand_emb, cand_id_map,
+            kept_rr, df_tokens, kept_gap, kept_nc, kept_sup
         )
 
         feats_df.to_parquet(out_p1, index=False)
