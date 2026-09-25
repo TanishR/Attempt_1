@@ -91,7 +91,7 @@ def encode_uniques_and_save(model, texts, ids, emb_prefix, tag, chunk_size=50000
     uniques_list = uniques.tolist()
     print(f"[{tag}] Whole-file dedup: {len(uniques_list)} uniques / {len(texts)} rows ({len(uniques_list)/len(texts)*100:.1f}%)")
 
-    parts_dir = os.path.join(CACHE_DIR, "parts")
+    parts_dir = os.path.join(os.path.dirname(emb_prefix), "parts")
     os.makedirs(parts_dir, exist_ok=True)
 
     num_parts = (len(uniques_list) + chunk_size - 1) // chunk_size
