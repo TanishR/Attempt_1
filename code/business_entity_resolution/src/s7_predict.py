@@ -17,12 +17,22 @@ import pandas as pd
 
 import config
 from decide import decide
+from s4_features import _id_to_int
 
 try:
     import psutil
     _HAS_PSUTIL = True
 except ImportError:
     _HAS_PSUTIL = False
+
+
+def _int_to_id(val) -> str:
+    """Decodes int64 back to original S1/S2/S3 string ID."""
+    if isinstance(val, (int, np.integer)):
+        prefix = int(val) // 1_000_000_000_000
+        num = int(val) % 1_000_000_000_000
+        return f"S{prefix}-{num}"
+    return str(val)
 
 
 def _rss_mb() -> float:
@@ -133,11 +143,17 @@ def predict_probabilities_chunked(
         X_chunk = chunk_df[config.FEATURES].values.astype(np.float32)
         preds = booster.predict(X_chunk)
 
+        # Convert IDs to int64 to save memory (24 bytes per row instead of ~150 bytes)
+        s1_int = _id_to_int(chunk_df["s1_id"], validate=True)
+        cand_int = _id_to_int(chunk_df["cand_id"], validate=True)
+        prob_vals = preds.astype(np.float32)
+        emb_vals = chunk_df["emb_score"].values.astype(np.float32)
+
         res_chunk = pd.DataFrame({
-            "s1_id": chunk_df["s1_id"].values,
-            "cand_id": chunk_df["cand_id"].values,
-            "prob": preds.astype(np.float32),
-            "emb_score": chunk_df["emb_score"].values.astype(np.float32),
+            "s1_id": s1_int,
+            "cand_id": cand_int,
+            "prob": prob_vals,
+            "emb_score": emb_vals,
         })
         prob_dfs.append(res_chunk)
         total_pairs += len(res_chunk)
@@ -222,6 +238,21 @@ def main():
     print("\n--- Applying Decision Layer (decide.py) ---")
     print(f"Decision Parameters: USE_EXCLUSIVITY={use_excl}, EXCL_MARGIN={margin:.2f}, T_TOP1={t_top1:.2f}, T_EXTRA={t_extra:.2f}")
 
+    # Pre-exclusivity threshold filtering:
+    # Drops rows with prob < min(t_top1, t_extra) - margin.
+    # Gives mathematically identical decisions while reducing memory by ~90-95%.
+    thresh_floor = min(t_top1, t_extra) - margin
+    n_before = len(probs_df)
+    probs_df = probs_df[probs_df["prob"] >= thresh_floor].reset_index(drop=True)
+    rss_filt = _rss_mb()
+    print(f"Filtered candidate pairs with prob >= {thresh_floor:.4f} before exclusivity: "
+          f"{len(probs_df):,} kept / {n_before:,} ({len(probs_df)/max(1, n_before)*100:.2f}%)  "
+          f"(RSS {rss_filt:.0f} MB)", flush=True)
+
+    target_s1_ids_int = None
+    if target_s1_ids is not None:
+        target_s1_ids_int = _id_to_int(pd.Series(target_s1_ids)).tolist()
+
     t_dec_start = time.time()
     predictions = decide(
         probs_df=probs_df,
@@ -229,12 +260,19 @@ def main():
         t_extra=t_extra,
         margin=margin,
         use_exclusivity=use_excl,
-        all_s1_ids=target_s1_ids
+        all_s1_ids=target_s1_ids_int
     )
     print(f"Decisions computed for {len(predictions):,} S1 entities in {time.time() - t_dec_start:.2f}s")
 
     # 6. Save test predictions to parquet for s8_write.py
-    pred_records = [{"s1_id": s, "matched_ids": ",".join(cands)} for s, cands in predictions.items()]
+    # Convert IDs back to string format only for the final selected matches
+    pred_records = [
+        {
+            "s1_id": _int_to_id(s),
+            "matched_ids": ",".join(_int_to_id(c) for c in cands)
+        }
+        for s, cands in predictions.items()
+    ]
     pred_df = pd.DataFrame(pred_records)
     out_preds_path = os.path.join(cache_dir, f"{args.split}_predictions.parquet")
     pred_df.to_parquet(out_preds_path, index=False)
