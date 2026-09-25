@@ -292,6 +292,10 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
     }
     if 'label' in chunk_df.columns:
         feats_dict['label'] = chunk_df['label'].values.astype(np.int32)
+    if 'is_competitor' in chunk_df.columns:
+        feats_dict['is_competitor'] = chunk_df['is_competitor'].values.astype(np.int8)
+    else:
+        feats_dict['is_competitor'] = np.zeros(len(s1_ids), dtype=np.int8)
 
     feats_dict['rule_score'] = rule_score
 
@@ -314,10 +318,11 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
 
     return pd.DataFrame(feats_dict)
 
-def compute_global_reverse_ranks(cache_dir, split, chunk_files):
+def compute_global_reverse_ranks(cache_dir, split, chunk_files, sampled_s1_ids=None, val_s1_ids=None):
     """
-    Computes global reverse rank per cand_id across all candidates of the split before chunking.
-    Returns: list of numpy arrays, one per chunk file, containing reverse_rank for that chunk.
+    Computes global reverse rank per cand_id across all candidates of the split before chunking,
+    and identifies competitor S1s that share candidate(s) with val S1.
+    Returns: (list of numpy arrays containing reverse_rank for each chunk, set of competitor_s1_ids).
     """
     print("Computing global reverse_rank across all candidate chunks...")
     t0 = time.time()
@@ -342,7 +347,15 @@ def compute_global_reverse_ranks(cache_dir, split, chunk_files):
         offset += clen
         
     print(f"Global reverse_rank computed for {len(all_pairs_df)} pairs in {time.time() - t0:.2f}s")
-    return chunk_rr_list
+
+    competitor_s1_ids = set()
+    if val_s1_ids is not None and len(val_s1_ids) > 0:
+        val_cand_ids = set(all_pairs_df.loc[all_pairs_df['s1_id'].isin(val_s1_ids), 'cand_id'].values)
+        if val_cand_ids:
+            sharing_s1_ids = set(all_pairs_df.loc[all_pairs_df['cand_id'].isin(val_cand_ids), 's1_id'].values)
+            competitor_s1_ids = sharing_s1_ids - (sampled_s1_ids if sampled_s1_ids is not None else set())
+
+    return chunk_rr_list, competitor_s1_ids
 
 def print_acceptance_report(feats_df, elapsed_time):
     """
@@ -355,6 +368,12 @@ def print_acceptance_report(feats_df, elapsed_time):
     print("\n" + "=" * 90)
     print(f"STEP 6 FEATURE VERIFICATION REPORT ({n_pairs:,} candidate pairs)")
     print("=" * 90)
+    if 'is_competitor' in feats_df.columns:
+        n_comp_pairs = int((feats_df['is_competitor'] == 1).sum())
+        n_comp_s1 = int(feats_df.loc[feats_df['is_competitor'] == 1, 's1_id'].nunique())
+        print(f"Competitor S1: {n_comp_s1:,} entities ({n_comp_pairs:,} candidate pairs)")
+        print("-" * 90)
+
     print(f"{'Feature':<20} | {'Min':>7} | {'Max':>7} | {'Mean':>8} | {'% NaN':>6} | {'Pos Mean':>9} | {'Neg Mean':>9}")
     print("-" * 90)
 
@@ -410,15 +429,17 @@ def main():
     print(f"Total features configured: {len(config.FEATURES)}")
 
     # 0. For train split, load split.parquet to determine which S1 get features.
-    #    Blocking now runs over ALL S1 (for realistic reverse_rank/Channel D),
-    #    but features are only needed for the sampled train+val S1.
+    #    Blocking runs over ALL S1 (for realistic reverse_rank/Channel D),
+    #    features are computed for sampled S1 + competitor S1.
     sampled_s1_ids = None  # None means "keep all" (test split)
+    val_s1_ids = None
     if args.split == "train":
         split_path = os.path.join(cache_dir, "split.parquet")
         if os.path.exists(split_path):
             split_df = pd.read_parquet(split_path)
             sampled_s1_ids = set(split_df['s1_id'].values)
-            print(f"Loaded split.parquet: {len(sampled_s1_ids)} sampled S1 for feature extraction.")
+            val_s1_ids = set(split_df.loc[split_df['fold'] == 'val', 's1_id'].values)
+            print(f"Loaded split.parquet: {len(sampled_s1_ids):,} sampled S1 ({len(val_s1_ids):,} val S1) for feature extraction.")
         else:
             print("WARNING: split.parquet not found; computing features for ALL S1.")
 
@@ -500,12 +521,18 @@ def main():
     print("Loading candidate embedding arrays...")
     all_cand_emb, cand_id_map = load_candidate_embeddings(cache_dir, args.split)
 
-    # 5. Compute global reverse rank across ALL candidate pairs (full competition).
-    #    This includes candidates for S1 outside the sample, so reverse_rank
-    #    reflects realistic test-time competition levels.
-    chunk_rr_list = compute_global_reverse_ranks(cache_dir, args.split, chunk_files)
+    # 5. Compute global reverse rank across ALL candidate pairs (full competition)
+    #    and identify competitor S1s that share candidate(s) with val S1.
+    chunk_rr_list, competitor_s1_ids = compute_global_reverse_ranks(
+        cache_dir, args.split, chunk_files, sampled_s1_ids, val_s1_ids
+    )
+    print(f"Report: Competitor S1 count: {len(competitor_s1_ids):,}")
 
-    # 6. Process each pending chunk — filter to sampled S1 only (train) or all (test)
+    target_s1_ids = None
+    if sampled_s1_ids is not None:
+        target_s1_ids = sampled_s1_ids | competitor_s1_ids
+
+    # 6. Process each pending chunk — filter to sampled S1 + competitors (train) or all (test)
     processed_feats = []
     t_feat_start = time.time()
     for idx, cf, out_p1, out_p2 in pending_chunks:
@@ -514,16 +541,19 @@ def main():
         chunk_cands = pd.read_parquet(cf)
         chunk_rr = chunk_rr_list[idx]
 
-        # Filter to sampled S1 only (for train split)
-        if sampled_s1_ids is not None:
-            keep_mask = chunk_cands['s1_id'].isin(sampled_s1_ids)
+        # Filter to sampled S1 + competitors (for train split)
+        if target_s1_ids is not None:
+            keep_mask = chunk_cands['s1_id'].isin(target_s1_ids)
             n_before = len(chunk_cands)
             chunk_cands = chunk_cands[keep_mask].reset_index(drop=True)
             chunk_rr = chunk_rr[keep_mask.values]
-            print(f"  Filtered to sampled S1: {n_before} -> {len(chunk_cands)} candidate pairs")
+            chunk_cands['is_competitor'] = chunk_cands['s1_id'].isin(competitor_s1_ids).astype(np.int8)
+            print(f"  Filtered to sampled + competitor S1: {n_before} -> {len(chunk_cands)} candidate pairs")
+        else:
+            chunk_cands['is_competitor'] = np.zeros(len(chunk_cands), dtype=np.int8)
 
         if len(chunk_cands) == 0:
-            print(f"  No sampled S1 in this chunk, skipping.")
+            print(f"  No sampled/competitor S1 in this chunk, skipping.")
             # Write empty file so resume sees it as done
             pd.DataFrame(columns=['s1_id', 'cand_id']).to_parquet(out_p1, index=False)
             continue
