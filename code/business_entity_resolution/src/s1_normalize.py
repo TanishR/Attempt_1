@@ -140,7 +140,7 @@ def normalize_name(raw_name):
     return name_full, name_a, name_b, core_name, legal, core_sorted, name_skel
 
 STREET_WORDS = {
-    "rue", "avenue", "road", "street", "boulevard", "allee", "impasse", "route", "faubourg", "lane", "drive", "way", "court", "st", "ave", "rd", "blvd", "dr", "ln", "ct", "pl", "ter"
+    "rue", "avenue", "road", "street", "boulevard", "allee", "impasse", "chemin", "route", "faubourg", "lane", "drive", "way", "court", "st", "ave", "rd", "blvd", "dr", "ln", "ct", "pl", "ter"
 }
 STOPWORDS = {"de", "du", "la", "le", "des", "of", "the"}
 STATE_WORDS = set(STATE_MAP.keys()).union(set(STATE_MAP.values()))
@@ -258,14 +258,13 @@ def normalize_address(raw_addr):
             break
             
     state_code = ""
-    for i in range(len(addr_tokens)):
-        if i < len(addr_tokens) - 1:
-            bigram = addr_tokens[i] + " " + addr_tokens[i+1]
-            if bigram in STATE_MAP:
-                state_code = STATE_MAP[bigram]
+    for n in range(4, 0, -1):
+        for i in range(len(addr_tokens) - n + 1):
+            ngram = " ".join(addr_tokens[i:i+n])
+            if ngram in STATE_MAP:
+                state_code = STATE_MAP[ngram]
                 break
-        if addr_tokens[i] in STATE_MAP:
-            state_code = STATE_MAP[addr_tokens[i]]
+        if state_code:
             break
             
     addr_missing = 1 if not addr_norm else 0

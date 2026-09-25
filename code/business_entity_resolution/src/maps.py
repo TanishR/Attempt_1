@@ -39,7 +39,12 @@ WEAK_TOKENS = {
 
 ADDR_ABBREVIATIONS = {
     "rd": "road",
-    "st": "street",
+    "street": "st",
+    "st": "st",
+    "saint": "st",
+    "sainte": "ste",
+    "ste": "ste",
+    "suite": "ste",
     "ave": "avenue",
     "av": "avenue",
     "blvd": "boulevard",
@@ -59,6 +64,7 @@ ADDR_ABBREVIATIONS = {
     # french words
     "all": "allee",
     "imp": "impasse",
+    "ch": "chemin",
     "chem": "chemin",
     "rte": "route",
     "fg": "faubourg",
@@ -127,5 +133,13 @@ STATE_MAP = {
     "tripura": "tr",
     "uttar pradesh": "up",
     "uttarakhand": "uk", "uttaranchal": "uk",
-    "west bengal": "wb"
+    "west bengal": "wb",
+
+    # France Regions and Departments
+    "nord": "hdf", "pas de calais": "hdf", "hauts de france": "hdf",
+    "gironde": "naq", "nouvelle aquitaine": "naq",
+    "loire atlantique": "pdl", "pays de la loire": "pdl",
+    "ile de france": "idf", "paris": "idf",
+    "bretagne": "bre",
+    "normandie": "nor"
 }
