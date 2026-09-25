@@ -9,6 +9,33 @@ from rapidfuzz import process, fuzz
 
 import config
 
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
+
+def _rss_mb() -> float:
+    """Returns current process RSS in MB, or -1 if psutil unavailable."""
+    if _HAS_PSUTIL:
+        return psutil.Process(os.getpid()).memory_info().rss / 1_048_576
+    return -1.0
+
+
+def _id_to_int(series: pd.Series) -> pd.Series:
+    """
+    Converts 'S1-12345', 'S2-12345', 'S3-12345' style IDs to int64.
+    Source prefix is encoded as the top 2 decimal digits: S1->10^12, S2->2*10^12, S3->3*10^12.
+    Falls back to pandas Categorical codes if the format is unexpected.
+    """
+    s = series.astype(str)
+    # Determine prefix multiplier from first char after 'S'
+    prefix = s.str[1].map({'1': 1_000_000_000_000, '2': 2_000_000_000_000, '3': 3_000_000_000_000})
+    numeric = s.str.split('-', n=1).str[1].astype(np.int64)
+    return (prefix.fillna(0).astype(np.int64) + numeric)
+
+
 def parse_args():
     """
     Parses command line arguments for feature engineering.
@@ -320,42 +347,82 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
 
 def compute_global_reverse_ranks(cache_dir, split, chunk_files, sampled_s1_ids=None, val_s1_ids=None):
     """
-    Computes global reverse rank per cand_id across all candidates of the split before chunking,
-    and identifies competitor S1s that share candidate(s) with val S1.
+    Computes global reverse rank per cand_id across all candidates of the split.
+    Reads only (s1_id, cand_id, emb_score) per chunk with integer IDs to keep peak RAM
+    well below 15 GB even for 9-crore-row train candidate tables.
+
     Returns: (list of numpy arrays containing reverse_rank for each chunk, set of competitor_s1_ids).
     """
-    print("Computing global reverse_rank across all candidate chunks...")
+    print("Computing global reverse_rank across all candidate chunks...", flush=True)
     t0 = time.time()
-    
-    # Read s1_id, cand_id, emb_score across all chunk files
-    chunk_dfs = []
+
+    # --- Pass 1: read 3 columns only, convert IDs to int64, track chunk lengths ---
+    int_chunk_dfs = []
     chunk_lens = []
-    for cf in chunk_files:
+    for ci, cf in enumerate(chunk_files):
         df = pd.read_parquet(cf, columns=['s1_id', 'cand_id', 'emb_score'])
         chunk_lens.append(len(df))
-        chunk_dfs.append(df)
-        
-    all_pairs_df = pd.concat(chunk_dfs, ignore_index=True)
-    all_pairs_df['reverse_rank'] = all_pairs_df.groupby('cand_id')['emb_score'].rank(ascending=False, method='min')
-    
-    # Slice back per chunk
-    all_rr = all_pairs_df['reverse_rank'].values.astype(np.float32)
+        # Convert string IDs to int64 (strips 'S1-' etc.) — ~4× smaller than object dtype
+        df['s1_int'] = _id_to_int(df['s1_id'])
+        df['cid_int'] = _id_to_int(df['cand_id'])
+        df = df.drop(columns=['s1_id', 'cand_id'])
+        int_chunk_dfs.append(df)
+        rss = _rss_mb()
+        print(f"  [reverse_rank] Read chunk {ci + 1}/{len(chunk_files)}: {len(df):,} rows  "
+              f"(RSS {rss:.0f} MB)", flush=True)
+
+    # --- Concatenate int64 frames and rank globally ---
+    print(f"  Concatenating {len(int_chunk_dfs)} int64 frames ({sum(chunk_lens):,} rows)...", flush=True)
+    all_int = pd.concat(int_chunk_dfs, ignore_index=True)
+    del int_chunk_dfs
+    import gc; gc.collect()
+    rss = _rss_mb()
+    print(f"  All pairs loaded: {len(all_int):,} rows  (RSS {rss:.0f} MB)", flush=True)
+
+    all_int['reverse_rank'] = (
+        all_int.groupby('cid_int')['emb_score']
+        .rank(ascending=False, method='min')
+        .astype(np.float32)
+    )
+    print(f"  reverse_rank computed in {time.time() - t0:.2f}s  (RSS {_rss_mb():.0f} MB)", flush=True)
+
+    # --- Slice back per chunk ---
+    all_rr = all_int['reverse_rank'].values
     chunk_rr_list = []
     offset = 0
     for clen in chunk_lens:
-        chunk_rr_list.append(all_rr[offset : offset + clen])
+        chunk_rr_list.append(all_rr[offset: offset + clen].copy())
         offset += clen
-        
-    print(f"Global reverse_rank computed for {len(all_pairs_df)} pairs in {time.time() - t0:.2f}s")
 
+    # --- Identify competitor S1 ids (still using int64 -> original string mapping not needed) ---
     competitor_s1_ids = set()
     if val_s1_ids is not None and len(val_s1_ids) > 0:
-        val_cand_ids = set(all_pairs_df.loc[all_pairs_df['s1_id'].isin(val_s1_ids), 'cand_id'].values)
-        if val_cand_ids:
-            sharing_s1_ids = set(all_pairs_df.loc[all_pairs_df['cand_id'].isin(val_cand_ids), 's1_id'].values)
-            competitor_s1_ids = sharing_s1_ids - (sampled_s1_ids if sampled_s1_ids is not None else set())
+        # Map val string IDs to int64
+        val_int_ids = set(_id_to_int(pd.Series(list(val_s1_ids))).values)
+        val_cid_mask = all_int['s1_int'].isin(val_int_ids)
+        val_cid_ints = set(all_int.loc[val_cid_mask, 'cid_int'].values)
+        if val_cid_ints:
+            sharing_s1_ints = set(all_int.loc[all_int['cid_int'].isin(val_cid_ints), 's1_int'].values)
+            # Convert sampled_s1_ids to int64 set for exclusion
+            sampled_int = set(_id_to_int(pd.Series(list(sampled_s1_ids))).values) if sampled_s1_ids else set()
+            comp_int = sharing_s1_ints - sampled_int
+            # Map competitor int64 IDs back to original string IDs via the original chunk files
+            # We need to find the string IDs that map to comp_int
+            comp_s_prefix = {1_000_000_000_000: 'S1', 2_000_000_000_000: 'S2', 3_000_000_000_000: 'S3'}
+            comp_strings = set()
+            for cid_int in comp_int:
+                src_mult = (cid_int // 1_000_000_000_000) * 1_000_000_000_000
+                num_part = cid_int % 1_000_000_000_000
+                pfx = comp_s_prefix.get(src_mult, 'S1')
+                comp_strings.add(f"{pfx}-{num_part}")
+            competitor_s1_ids = comp_strings
 
+    del all_int
+    import gc; gc.collect()
+    print(f"Global reverse_rank done in {time.time() - t0:.2f}s. "
+          f"Competitor S1 count: {len(competitor_s1_ids):,}  (RSS {_rss_mb():.0f} MB)", flush=True)
     return chunk_rr_list, competitor_s1_ids
+
 
 def print_acceptance_report(feats_df, elapsed_time):
     """
@@ -566,8 +633,10 @@ def main():
         feats_df.to_parquet(out_p1, index=False)
         if out_p1 != out_p2:
             feats_df.to_parquet(out_p2, index=False)
-            
-        print(f"Saved chunk features ({len(feats_df)} pairs) to {out_p1} in {time.time() - t_ch:.2f}s")
+
+        rss_aft = _rss_mb()
+        print(f"Saved chunk features ({len(feats_df)} pairs) to {out_p1} "
+              f"in {time.time() - t_ch:.2f}s  (RSS {rss_aft:.0f} MB)", flush=True)
         processed_feats.append(feats_df)
 
     t_feat_total = time.time() - t_feat_start

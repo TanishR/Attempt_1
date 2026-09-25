@@ -18,6 +18,20 @@ import pandas as pd
 import config
 from decide import decide
 
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
+
+def _rss_mb() -> float:
+    """Returns current process RSS in MB, or -1 if psutil unavailable."""
+    if _HAS_PSUTIL:
+        return psutil.Process(os.getpid()).memory_info().rss / 1_048_576
+    return -1.0
+
+
 
 def parse_args():
     """
@@ -92,7 +106,7 @@ def predict_probabilities_chunked(
     Predicts probabilities chunk-wise across feature files and saves test_probs.parquet.
     Returns: full DataFrame containing ['s1_id', 'cand_id', 'prob', 'emb_score'].
     """
-    print(f"\nComputing predictions chunk-wise across {len(feat_files)} feature file(s)...")
+    print(f"\nComputing predictions chunk-wise across {len(feat_files)} feature file(s)...", flush=True)
     prob_dfs = []
     t_start = time.time()
     total_pairs = 0
@@ -101,7 +115,9 @@ def predict_probabilities_chunked(
 
     for idx, fp in enumerate(feat_files):
         t_ch = time.time()
-        print(f"  Predicting chunk {idx + 1}/{len(feat_files)}: {os.path.basename(fp)}...")
+        rss_before = _rss_mb()
+        print(f"  Predicting chunk {idx + 1}/{len(feat_files)}: {os.path.basename(fp)}  "
+              f"(RSS {rss_before:.0f} MB)...", flush=True)
         cols_to_load = ["s1_id", "cand_id", "emb_score"] + config.FEATURES
         # Handle duplicates in cols_to_load (emb_score is already in config.FEATURES)
         cols_unique = list(dict.fromkeys(cols_to_load))
@@ -111,7 +127,7 @@ def predict_probabilities_chunked(
             chunk_df = chunk_df[chunk_df["s1_id"].isin(filter_s1_ids)].reset_index(drop=True)
 
         if len(chunk_df) == 0:
-            print(f"    Chunk {idx + 1} has 0 matching rows, skipping.")
+            print(f"    Chunk {idx + 1} has 0 matching rows, skipping.", flush=True)
             continue
 
         X_chunk = chunk_df[config.FEATURES].values.astype(np.float32)
@@ -125,17 +141,21 @@ def predict_probabilities_chunked(
         })
         prob_dfs.append(res_chunk)
         total_pairs += len(res_chunk)
-        print(f"    Predicted {len(res_chunk):,} pairs in {time.time() - t_ch:.2f}s")
+        rss_after = _rss_mb()
+        print(f"    Predicted {len(res_chunk):,} pairs in {time.time() - t_ch:.2f}s  "
+              f"(RSS {rss_after:.0f} MB)", flush=True)
 
     if not prob_dfs:
-        print("Warning: No feature pairs found to predict.")
+        print("Warning: No feature pairs found to predict.", flush=True)
         full_probs_df = pd.DataFrame(columns=["s1_id", "cand_id", "prob", "emb_score"])
     else:
         full_probs_df = pd.concat(prob_dfs, ignore_index=True)
 
     full_probs_df.to_parquet(out_probs_path, index=False)
-    print(f"Saved {len(full_probs_df):,} total probability pairs to: {out_probs_path} (elapsed: {time.time() - t_start:.2f}s)")
+    print(f"Saved {len(full_probs_df):,} total probability pairs to: {out_probs_path} "
+          f"(elapsed: {time.time() - t_start:.2f}s  RSS {_rss_mb():.0f} MB)", flush=True)
     return full_probs_df
+
 
 
 def main():

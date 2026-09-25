@@ -7,6 +7,18 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 import torch
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
+
+def _rss_mb() -> float:
+    """Returns current process RSS in MB, or -1 if psutil unavailable."""
+    if _HAS_PSUTIL:
+        return psutil.Process(os.getpid()).memory_info().rss / 1_048_576
+    return -1.0
 
 sys.path.insert(0, os.path.abspath("code/business_entity_resolution/src"))
 from config import (
@@ -625,10 +637,12 @@ def main():
         chunk_files.append(chunk_out_path)
         
         if os.path.exists(chunk_out_path):
-            print(f"Chunk {ch_idx + 1}/{num_chunks} already exists ({chunk_out_path}), skipping...")
+            print(f"Chunk {ch_idx + 1}/{num_chunks} already exists ({chunk_out_path}), skipping...", flush=True)
             continue
-            
-        print(f"\n>>> Processing Chunk {ch_idx + 1}/{num_chunks}...")
+
+        elapsed_so_far = time.time() - start_total_time
+        rss = _rss_mb()
+        print(f"\n>>> Processing Chunk {ch_idx + 1}/{num_chunks}  (elapsed {elapsed_so_far:.0f}s, RSS {rss:.0f} MB)", flush=True)
         c_s1_ids = all_s1_ids[ch_idx * chunk_size : (ch_idx + 1) * chunk_size]
         sub_s1_keys = s1_keys_df[s1_keys_df['entity_id'].isin(c_s1_ids)].copy()
         
@@ -766,35 +780,107 @@ def main():
             chunk_df['label'] = chunk_df['label'].fillna(0).astype(int)
             
         chunk_df.to_parquet(chunk_out_path, index=False)
-        print(f"Saved chunk {ch_idx + 1} ({len(chunk_df)} candidate pairs) to {chunk_out_path}")
+        elapsed_ch = time.time() - start_total_time
+        rss_ch = _rss_mb()
+        print(f"Saved chunk {ch_idx + 1}/{num_chunks} ({len(chunk_df)} candidate pairs) to {chunk_out_path}  "
+              f"(total elapsed {elapsed_ch:.0f}s, RSS {rss_ch:.0f} MB)", flush=True)
+        del chunk_df, chunk_cands_list
+        gc.collect()
 
-    # Merge all chunk parquets into final cands_{split}.parquet
+    # --------------------------------------------------------------------------
+    # Post-processing: build final cands_{split}.parquet without loading all
+    # chunks at once with string IDs (prevents 31-GB OOM).
+    # Strategy: read each chunk with categorical IDs, concat, save.
+    # For the recall report we only load val-sample S1 rows.
+    # --------------------------------------------------------------------------
+    elapsed_total = time.time() - start_total_time
+    rss_post = _rss_mb()
+    print(f"\n--- Post-processing: merging {len(chunk_files)} chunk(s)  "
+          f"(elapsed so far {elapsed_total:.0f}s, RSS {rss_post:.0f} MB) ---", flush=True)
+
     final_cands_path = os.path.join(cache_dir, f"cands_{args.split}.parquet")
-    all_chunks_df = [pd.read_parquet(cp) for cp in chunk_files if os.path.exists(cp)]
-    
-    if all_chunks_df:
-        final_df = pd.concat(all_chunks_df, ignore_index=True)
+
+    # Determine val-sample S1 ids for the recall report (train only)
+    val_s1_set = set()
+    if args.split == "train" and gt_df is not None:
+        split_path = os.path.join(cache_dir, "split.parquet")
+        if os.path.exists(split_path):
+            split_df = pd.read_parquet(split_path, columns=['s1_id'])
+            val_s1_set = set(split_df['s1_id'].values)
+            print(f"  Val-sample S1 for recall report: {len(val_s1_set):,}", flush=True)
+
+    # Read chunks with categorical IDs to keep peak RAM low
+    chunk_dfs_cat = []
+    total_pairs_count = 0
+    for ci, cp in enumerate(chunk_files):
+        if not os.path.exists(cp):
+            continue
+        df_c = pd.read_parquet(cp)
+        # Convert string IDs to categoricals (much smaller in RAM)
+        df_c['s1_id'] = df_c['s1_id'].astype('category')
+        df_c['cand_id'] = df_c['cand_id'].astype('category')
+        total_pairs_count += len(df_c)
+        chunk_dfs_cat.append(df_c)
+        rss_ci = _rss_mb()
+        print(f"  Read chunk {ci + 1}/{len(chunk_files)}: {len(df_c):,} pairs  (RSS {rss_ci:.0f} MB)", flush=True)
+        del df_c
+        gc.collect()
+
+    if chunk_dfs_cat:
+        print(f"  Concatenating {len(chunk_dfs_cat)} chunks ({total_pairs_count:,} total pairs)...", flush=True)
+        final_df = pd.concat(chunk_dfs_cat, ignore_index=True)
+        # Restore string IDs
+        final_df['s1_id'] = final_df['s1_id'].astype(str)
+        final_df['cand_id'] = final_df['cand_id'].astype(str)
+        del chunk_dfs_cat
+        gc.collect()
     else:
-        final_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank', 'ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev'])
-        
+        final_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank',
+                                         'ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev'])
+
     final_df.to_parquet(final_cands_path, index=False)
     elapsed_total = time.time() - start_total_time
-    print(f"\nFinal candidates saved to: {final_cands_path}")
-    print(f"Total candidate pairs: {len(final_df)} in {elapsed_total:.2f}s")
+    rss_final = _rss_mb()
+    print(f"\nFinal candidates saved to: {final_cands_path}", flush=True)
+    print(f"Total candidate pairs: {len(final_df):,} in {elapsed_total:.2f}s  (RSS {rss_final:.0f} MB)", flush=True)
 
-    # If training split, run full recall report
+    # Recall report: only load val-sample S1 rows to avoid reloading full final_df
     if args.split == "train" and gt_df is not None:
-        norm_s1 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source1.parquet"))
-        norm_s2 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source2.parquet"))
-        norm_s3 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source3.parquet"))
-        run_recall_report(final_df, gt_df, norm_s1, norm_s2, norm_s3, cand_cap=CAND_CAP)
-        
+        print("\n--- Running recall report (val-sample S1 only) ---", flush=True)
+        if val_s1_set:
+            recall_df = final_df[final_df['s1_id'].isin(val_s1_set)].copy()
+        else:
+            recall_df = final_df
+        rss_recall = _rss_mb()
+        print(f"  Recall report rows: {len(recall_df):,}  (RSS {rss_recall:.0f} MB)", flush=True)
+
+        norm_cols = ['entity_id', 'name_full', 'addr_norm', 'country']
+        norm_s1 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source1.parquet"),
+                                  columns=norm_cols)
+        norm_s1 = norm_s1[norm_s1['entity_id'].isin(val_s1_set)] if val_s1_set else norm_s1
+        norm_s2 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source2.parquet"),
+                                  columns=norm_cols)
+        norm_s3 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source3.parquet"),
+                                  columns=norm_cols)
+        run_recall_report(recall_df, gt_df, norm_s1, norm_s2, norm_s3, cand_cap=CAND_CAP)
+        del recall_df, norm_s1, norm_s2, norm_s3
+        gc.collect()
+
         if CAND_CAP < 50:
             is_sym = (final_df['ch_addr'] == 1) | (final_df['ch_skel'] == 1) | (final_df.get('ch_rare', 0) == 1)
-            final_df = final_df.assign(is_sym=is_sym).sort_values(['s1_id', 'is_sym', 'emb_score'], ascending=[True, False, False]).drop(columns=['is_sym'])
+            final_df = final_df.assign(is_sym=is_sym).sort_values(
+                ['s1_id', 'is_sym', 'emb_score'], ascending=[True, False, False]
+            ).drop(columns=['is_sym'])
             final_df = final_df.groupby('s1_id').head(CAND_CAP).reset_index(drop=True)
             final_df.to_parquet(final_cands_path, index=False)
-            print(f"\nTruncated final candidates file to CAND_CAP={CAND_CAP}: {len(final_df)} candidate pairs saved to {final_cands_path}")
+            print(f"\nTruncated final candidates to CAND_CAP={CAND_CAP}: "
+                  f"{len(final_df):,} pairs saved to {final_cands_path}", flush=True)
+
+    # Write done-marker (must be last so resume only skips if truly complete)
+    done_marker = os.path.join(cache_dir, f"cands_{args.split}.done")
+    with open(done_marker, 'w') as _f:
+        _f.write("done\n")
+    print(f"Done-marker written: {done_marker}", flush=True)
 
 if __name__ == "__main__":
     main()

@@ -87,6 +87,12 @@ run_stage() {
         return 0
     fi
 
+    # When force-running, remove the old marker so a partial re-run doesn't leave a stale marker
+    if [ "${FORCE_RUN}" = true ] && [ -f "${marker_file}" ]; then
+        echo "[FORCE] Removing done-marker for Stage ${stage_num}: ${marker_file}"
+        rm -f "${marker_file}"
+    fi
+
     echo ""
     echo "================================================================================"
     echo "STAGE ${stage_num}: ${stage_desc}"
