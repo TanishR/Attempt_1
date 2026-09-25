@@ -82,7 +82,7 @@ def test_normalization():
     n_g1 = normalize_name("Gavue Resources LLC")
     n_g2 = normalize_name("Gavue Resources L.L.C.")
     sk_g = token_sort_ratio(n_g1[6], n_g2[6])
-    assert sk_g >= 80, f"Gavue Resources failed: {sk_g}"
+    assert sk_g > 80, f"Gavue Resources failed: {sk_g}"
     
     # Addresses "1 Franklin Street, Unit 4706, Boston, MA" vs "1 FRANKLIN ST, BOSTON, MA"
     a_f1 = normalize_address("1 Franklin Street, Unit 4706, Boston, MA")

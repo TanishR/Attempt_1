@@ -48,6 +48,7 @@ def get_consonant_skeleton(text):
 URL_CLEAN_RE = re.compile(r'\b(www\.)|(\.com|\.in|\.org|\.net|\.fr)\b')
 TRAILING_ID_RE = re.compile(r'[-\s#]+[0-9]{4,}\s*$')
 PUNCT_RE = re.compile(r'[^\w\s]')
+DOTTED_ACRONYM_RE = re.compile(r'\b([a-z])[\.\s]+(?=[a-z]\b)')
 
 def normalize_name(raw_name):
     if not isinstance(raw_name, str) or not raw_name.strip():
@@ -64,6 +65,17 @@ def normalize_name(raw_name):
             
     n = URL_CLEAN_RE.sub('', n)
     
+    # Apostrophes
+    n = n.replace("'", "").replace("’", "")
+    
+    # Dotted acronyms
+    # Apply repeatedly to handle L.L.C. -> LLC
+    while True:
+        n_new = DOTTED_ACRONYM_RE.sub(r'\1', n)
+        if n_new == n: break
+        n = n_new
+    n = n.replace('m/s', 'ms')
+    
     name_a, name_b = "", ""
     if ' dba ' in n:
         parts = n.split(' dba ', 1)
@@ -71,14 +83,20 @@ def normalize_name(raw_name):
         name_b = parts[1].strip()
     
     n = TRAILING_ID_RE.sub('', n)
-    
     n = n.replace('&', ' and ')
     n = PUNCT_RE.sub(' ', n)
     
     tokens = n.split()
     norm_tokens = []
     for t in tokens:
-        mapped = NAME_ABBREVIATIONS.get(t, t)
+        sk = get_consonant_skeleton(t)
+        if sk == "prvt":
+            mapped = "private"
+        elif sk in ("lmtd", "lmtt"):
+            mapped = "limited"
+        else:
+            mapped = NAME_ABBREVIATIONS.get(t, t)
+            
         if not norm_tokens or norm_tokens[-1] != mapped:
             norm_tokens.append(mapped)
             
@@ -114,7 +132,6 @@ def normalize_address(raw_addr):
         return "", "", "", 0, "", "", "", 1
         
     a = transliterate_if_needed(raw_addr).lower()
-    
     a = a.replace('&', ' and ')
     a_punct_removed = PUNCT_RE.sub(' ', a)
     
@@ -159,7 +176,7 @@ def normalize_address(raw_addr):
                 if digits_only:
                     house_no = digits_only.lstrip("0") or "0"
                     break
-
+                
     zip_pin = ""
     for t in reversed(tokens):
         if len(t) in (5, 6) and t.isdigit():
@@ -194,7 +211,6 @@ def process_chunk(df_chunk):
         n_full, n_a, n_b, core, legal, c_sorted, skel = normalize_name(raw_name)
         a_norm, a_unit, h_no, h_mask, num_tok, z_pin, st_code, a_miss = normalize_address(raw_addr)
         
-        # If the name is completely empty after normalization but raw_name was not, fallback to transliterated raw name
         if not n_full and raw_name and str(raw_name).strip():
             fallback = transliterate_if_needed(raw_name).lower()
             fallback = PUNCT_RE.sub(' ', fallback).strip()
@@ -216,7 +232,7 @@ def process_chunk(df_chunk):
             "core_sorted": c_sorted,
             "name_skel": skel,
             "addr_norm": a_norm,
-            "addr_tokens": a_norm, # same as addr_norm based on requirements
+            "addr_tokens": a_norm, 
             "unit_tokens": a_unit,
             "house_no": h_no,
             "house_masked": h_mask,
@@ -267,7 +283,6 @@ if __name__ == "__main__":
     for f in files:
         in_path = os.path.join(CACHE_DIR, f)
         if not os.path.exists(in_path):
-            # Try raw if sample doesn't exist
             raw_f = f.replace("sample_", "raw_")
             in_path = os.path.join(CACHE_DIR, raw_f)
             if not os.path.exists(in_path):
@@ -282,7 +297,7 @@ if __name__ == "__main__":
         
     if total_rows > 0:
         overall_rate = total_rows / total_time
-        full_data_rows = 24000000 # ~2.4 crore
+        full_data_rows = 24000000 
         est_seconds = full_data_rows / overall_rate
         print(f"\nOverall rate: {overall_rate:.2f} rows/s")
         print(f"Estimated time for 2.4 crore rows: {est_seconds / 60:.2f} minutes")

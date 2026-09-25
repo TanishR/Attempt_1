@@ -16,7 +16,17 @@ NAME_ABBREVIATIONS = {
     "grp": "groupe",
     # additional french abbreviations
     "fils": "fils",
-    "freres": "freres"
+    "freres": "freres",
+    "praivet": "private",
+    "praibhet": "private",
+    "piraivet": "private",
+    "praivrr": "private",
+    "pra": "private",
+    "li": "limited",
+    "limitet": "limited",
+    "limirrd": "limited",
+    "limtid": "limited",
+    "elelpi": "llp"
 }
 
 LEGAL_SUFFIXES = {
