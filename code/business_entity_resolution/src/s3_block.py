@@ -3,6 +3,7 @@ import sys
 import gc
 import time
 import argparse
+from collections import Counter
 import numpy as np
 import pandas as pd
 import torch
@@ -10,7 +11,7 @@ import torch
 sys.path.insert(0, os.path.abspath("code/business_entity_resolution/src"))
 from config import (
     CACHE_DIR, CAND_CAP, K_PER_SOURCE, MAX_ADDR_CANDS,
-    MAX_SKEL_CANDS, MAX_BLOCK_SIZE, BLOCK_BY_COUNTRY
+    MAX_SKEL_CANDS, MAX_RARE_CANDS, MAX_BLOCK_SIZE, BLOCK_BY_COUNTRY
 )
 
 def get_args():
@@ -116,6 +117,56 @@ def build_channel_c_keys(df):
     sk_sorted = df_sk['name_skel'].astype(str).apply(lambda x: " ".join(sorted(x.split())))
     df_sk = df_sk.assign(c_key="SK_" + df_sk['country'] + "_" + sk_sorted)
     return df_sk[['entity_id', 'c_key']].drop_duplicates()
+
+def compute_address_token_df(s1_df, s2_df, s3_df):
+    """
+    Computes per-country document frequencies of address tokens (len >= 5) across S1+S2+S3.
+    Returns: dict mapping country string to Counter of {token: doc_count}.
+    """
+    df_tokens = {}
+    all_countries = set(s1_df['country']).union(set(s2_df['country'])).union(set(s3_df['country']))
+    for c in all_countries:
+        c_counter = Counter()
+        for df_src in [s1_df, s2_df, s3_df]:
+            if df_src.empty or 'country' not in df_src.columns or 'addr_norm' not in df_src.columns:
+                continue
+            sub = df_src[df_src['country'] == c]
+            for addr in sub['addr_norm'].dropna():
+                if not isinstance(addr, str) or not addr.strip():
+                    continue
+                toks = set(t for t in addr.split() if len(t) >= 5)
+                for t in toks:
+                    c_counter[t] += 1
+        df_tokens[c] = c_counter
+    return df_tokens
+
+def build_channel_e_keys(df, df_tokens):
+    """
+    Channel E: builds keys (country, tok1) and (country, sorted(tok1, tok2)) for 2 rarest address tokens (len >= 5).
+    Returns: pandas.DataFrame with columns ['entity_id', 'e_key'].
+    """
+    records = []
+    if 'addr_norm' not in df.columns or 'country' not in df.columns:
+        return pd.DataFrame(columns=['entity_id', 'e_key'])
+        
+    for eid, c, addr in zip(df['entity_id'], df['country'], df['addr_norm']):
+        if not isinstance(addr, str) or not addr.strip():
+            continue
+        toks = list(set(t for t in addr.split() if len(t) >= 5))
+        if not toks:
+            continue
+        c_counter = df_tokens.get(c, {})
+        toks.sort(key=lambda t: (c_counter.get(t, 0), t))
+        tok1 = toks[0]
+        records.append((eid, f"E1_{c}_{tok1}"))
+        if len(toks) >= 2:
+            tok2 = toks[1]
+            pair_key = "_".join(sorted([tok1, tok2]))
+            records.append((eid, f"E2_{c}_{pair_key}"))
+            
+    if records:
+        return pd.DataFrame(records, columns=['entity_id', 'e_key']).drop_duplicates()
+    return pd.DataFrame(columns=['entity_id', 'e_key'])
 
 def get_valid_keys(df, col, max_block_size):
     """
@@ -327,14 +378,16 @@ def run_recall_report(df_cands, gt, norm_s1, norm_s2, norm_s3):
     gt_pairs_df = gt_eval[gt_eval['found']][['s1_id', 'match_id']].rename(columns={'match_id': 'cand_id'})
     found_cands = df_cands.merge(gt_pairs_df, on=['s1_id', 'cand_id'], how='inner')
     
-    only_emb = len(found_cands[(found_cands['ch_emb'] == 1) & (found_cands['ch_addr'] == 0) & (found_cands['ch_skel'] == 0)])
-    only_addr = len(found_cands[(found_cands['ch_emb'] == 0) & (found_cands['ch_addr'] == 1) & (found_cands['ch_skel'] == 0)])
-    only_skel = len(found_cands[(found_cands['ch_emb'] == 0) & (found_cands['ch_addr'] == 0) & (found_cands['ch_skel'] == 1)])
+    only_emb = len(found_cands[(found_cands['ch_emb'] == 1) & (found_cands['ch_addr'] == 0) & (found_cands['ch_skel'] == 0) & (found_cands.get('ch_rare', 0) == 0)])
+    only_addr = len(found_cands[(found_cands['ch_emb'] == 0) & (found_cands['ch_addr'] == 1) & (found_cands['ch_skel'] == 0) & (found_cands.get('ch_rare', 0) == 0)])
+    only_skel = len(found_cands[(found_cands['ch_emb'] == 0) & (found_cands['ch_addr'] == 0) & (found_cands['ch_skel'] == 1) & (found_cands.get('ch_rare', 0) == 0)])
+    only_rare = len(found_cands[(found_cands['ch_emb'] == 0) & (found_cands['ch_addr'] == 0) & (found_cands['ch_skel'] == 0) & (found_cands.get('ch_rare', 0) == 1)])
     
     print(f"\n4. Unique Channel Contributions on Recovered GT Pairs:")
     print(f"   - Unique to Channel A (Embedding): {only_emb} ({only_emb/max(1, found_gt_pairs)*100:.2f}%)")
     print(f"   - Unique to Channel B (Address):   {only_addr} ({only_addr/max(1, found_gt_pairs)*100:.2f}%)")
     print(f"   - Unique to Channel C (Skeleton):  {only_skel} ({only_skel/max(1, found_gt_pairs)*100:.2f}%)")
+    print(f"   - Unique to Channel E (Rare Addr): {only_rare} ({only_rare/max(1, found_gt_pairs)*100:.2f}%)")
     
     # 5. Channel A Recall@k curve
     print(f"\n5. Channel A (Embedding) Recall@k Curve:")
@@ -411,6 +464,12 @@ def main():
     c3_keys_df = load_blocking_keys(cache_dir, args.split, "source3")
     c3_m_emb, c3_m_map, c3_m_ids, c3_a_emb, c3_a_map, c3_a_ids = load_embedding_arrays(cache_dir, args.split, "source3")
 
+    # Document frequency of address tokens (len >= 5) across S1+S2+S3 for Channel E
+    print("Computing address token document frequencies across S1+S2+S3...")
+    df_tokens = compute_address_token_df(s1_keys_df, c2_keys_df, c3_keys_df)
+    c2_e_keys = build_channel_e_keys(c2_keys_df, df_tokens)
+    c3_e_keys = build_channel_e_keys(c3_keys_df, df_tokens)
+
     # Load GT for label assignment if train/val split
     gt_df = None
     if args.split == "train":
@@ -444,13 +503,13 @@ def main():
         
         # Sources to block against
         cand_sources = [
-            ("source2", 0, c2_keys_df, c2_m_emb, c2_m_map, c2_m_ids, c2_a_emb, c2_a_map, c2_a_ids),
-            ("source3", 1, c3_keys_df, c3_m_emb, c3_m_map, c3_m_ids, c3_a_emb, c3_a_map, c3_a_ids)
+            ("source2", 0, c2_keys_df, c2_e_keys, c2_m_emb, c2_m_map, c2_m_ids, c2_a_emb, c2_a_map, c2_a_ids),
+            ("source3", 1, c3_keys_df, c3_e_keys, c3_m_emb, c3_m_map, c3_m_ids, c3_a_emb, c3_a_map, c3_a_ids)
         ]
         
         countries = sub_s1_keys['country'].dropna().unique() if BLOCK_BY_COUNTRY else ["ALL"]
         
-        for src_name, src_code, c_keys_df, c_m_emb, c_m_map, c_m_ids, c_a_emb, c_a_map, c_a_ids in cand_sources:
+        for src_name, src_code, c_keys_df, c_e_keys, c_m_emb, c_m_map, c_m_ids, c_a_emb, c_a_map, c_a_ids in cand_sources:
             if len(c_m_ids) == 0: continue
             
             for country in countries:
@@ -504,20 +563,34 @@ def main():
                 else:
                     df_c = pd.DataFrame(columns=['s1_id', 'cand_id', 'ch_skel'])
 
-                
+                # --- Channel E: Rare Address Tokens ---
+                s1_e_keys = build_channel_e_keys(s1_c_df, df_tokens)
+                c_e_keys_c = c_e_keys[c_e_keys['entity_id'].isin(cand_c_ids)]
+                if not s1_e_keys.empty and not c_e_keys_c.empty:
+                    valid_e = get_valid_keys(c_e_keys_c, 'e_key', MAX_BLOCK_SIZE)
+                    s1_e_valid = s1_e_keys[s1_e_keys['e_key'].isin(valid_e)]
+                    c_e_valid = c_e_keys_c[c_e_keys_c['e_key'].isin(valid_e)]
+                    df_e = s1_e_valid.merge(c_e_valid, on='e_key').rename(
+                        columns={'entity_id_x': 's1_id', 'entity_id_y': 'cand_id'}
+                    )[['s1_id', 'cand_id']].drop_duplicates()
+                    df_e = df_e.groupby('s1_id').head(MAX_RARE_CANDS).reset_index(drop=True)
+                    df_e['ch_rare'] = 1
+                else:
+                    df_e = pd.DataFrame(columns=['s1_id', 'cand_id', 'ch_rare'])
+
                 # --- Union Channels ---
-                merged_cands = pd.concat([df_a, df_b, df_c], ignore_index=True)
+                merged_cands = pd.concat([df_a, df_b, df_c, df_e], ignore_index=True)
                 if merged_cands.empty:
                     continue
                     
                 agg_dict = {
-                    'ch_emb': 'max', 'ch_addr': 'max', 'ch_skel': 'max',
+                    'ch_emb': 'max', 'ch_addr': 'max', 'ch_skel': 'max', 'ch_rare': 'max',
                     'emb_score': 'max', 'emb_rank': 'min'
                 }
                 merged_cands = merged_cands.groupby(['s1_id', 'cand_id']).agg(agg_dict).reset_index()
-                merged_cands[['ch_emb', 'ch_addr', 'ch_skel']] = merged_cands[['ch_emb', 'ch_addr', 'ch_skel']].fillna(0).astype(int)
+                merged_cands[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare']] = merged_cands[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare']].fillna(0).astype(int)
                 
-                # Compute missing emb_score for Channel B/C candidates
+                # Compute missing emb_score for non-Channel A candidates
                 missing_mask = merged_cands['emb_score'].isna()
                 if missing_mask.any():
                     df_miss = merged_cands[missing_mask]
@@ -532,7 +605,7 @@ def main():
                 chunk_cands_list.append(merged_cands)
                 
         if not chunk_cands_list:
-            chunk_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank', 'ch_emb', 'ch_addr', 'ch_skel'])
+            chunk_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank', 'ch_emb', 'ch_addr', 'ch_skel', 'ch_rare'])
         else:
             chunk_df = pd.concat(chunk_cands_list, ignore_index=True)
             # Cap candidates per S1 to CAND_CAP (top by emb_score)
@@ -556,7 +629,7 @@ def main():
     if all_chunks_df:
         final_df = pd.concat(all_chunks_df, ignore_index=True)
     else:
-        final_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank', 'ch_emb', 'ch_addr', 'ch_skel'])
+        final_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank', 'ch_emb', 'ch_addr', 'ch_skel', 'ch_rare'])
         
     final_df.to_parquet(final_cands_path, index=False)
     elapsed_total = time.time() - start_total_time
