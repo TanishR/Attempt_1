@@ -51,93 +51,126 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_val_probabilities(cache_dir: str, version: str) -> pd.DataFrame:
+def load_val_probabilities(cache_dir: str, version: str, val_s1_set: Set[str]) -> pd.DataFrame:
     """
-    Loads validation and competitor prediction probabilities from cache.
-    Merges emb_score from feature files if not already present.
-    Converts s1_id and cand_id to int64 via _id_to_int and keeps only needed columns
-    with compact dtypes (int64/float32/int8).
-    Returns: DataFrame containing s1_id (int64), cand_id (int64), prob (float32), is_competitor (int8), and optional emb_score (float32).
+    Loads validation and competitor prediction probabilities from cache or computes them chunk-by-chunk.
+    - If val_probs_<version>.parquet exists with all 5 columns: [s1_id, cand_id, prob, emb_score, is_competitor], loads it directly.
+    - Otherwise, loads trained LightGBM model from cache/model_<version>.txt and generates
+      predictions chunk-by-chunk across feats_train_chunk_*.parquet:
+        * Keeps only val S1 rows and competitor S1 rows (is_competitor == 1).
+        * Converts s1_id and cand_id to int64 via _id_to_int.
+        * Retains only [s1_id int64, cand_id int64, prob float32, emb_score float32, is_competitor int8].
+        * Writes the result to cache/val_probs_<version>.parquet so future runs are instantaneous.
+    Returns: DataFrame containing s1_id (int64), cand_id (int64), prob (float32), emb_score (float32), is_competitor (int8).
     """
     probs_path = os.path.join(cache_dir, f"val_probs_{version}.parquet")
-    if not os.path.exists(probs_path):
-        raise FileNotFoundError(f"Missing {probs_path}. Run Step 7 first.")
+    required_cols = {"s1_id", "cand_id", "prob", "emb_score", "is_competitor"}
 
-    probs_df = pd.read_parquet(probs_path)
-    print(f"Loaded {len(probs_df):,} probability rows from {probs_path}")
+    if os.path.exists(probs_path):
+        probs_df = pd.read_parquet(probs_path)
+        if required_cols.issubset(probs_df.columns):
+            print(f"Loaded existing {len(probs_df):,} probability rows from {probs_path}")
+            # Ensure compact dtypes
+            if probs_df["s1_id"].dtype == object or isinstance(probs_df["s1_id"].iloc[0], str):
+                probs_df["s1_id"] = _id_to_int(probs_df["s1_id"], validate=True)
+            if probs_df["cand_id"].dtype == object or isinstance(probs_df["cand_id"].iloc[0], str):
+                probs_df["cand_id"] = _id_to_int(probs_df["cand_id"], validate=True)
+            probs_df["s1_id"] = probs_df["s1_id"].astype(np.int64)
+            probs_df["cand_id"] = probs_df["cand_id"].astype(np.int64)
+            probs_df["prob"] = probs_df["prob"].astype(np.float32)
+            probs_df["emb_score"] = probs_df["emb_score"].astype(np.float32)
+            probs_df["is_competitor"] = probs_df["is_competitor"].astype(np.int8)
+            return probs_df[["s1_id", "cand_id", "prob", "emb_score", "is_competitor"]]
+        else:
+            print(f"{probs_path} missing required columns {required_cols - set(probs_df.columns)}, recomputing...")
 
-    # Convert IDs to int64 before exclusivity
-    if probs_df["s1_id"].dtype == object or isinstance(probs_df["s1_id"].iloc[0], str):
-        probs_df["s1_id"] = _id_to_int(probs_df["s1_id"], validate=True)
-    if probs_df["cand_id"].dtype == object or isinstance(probs_df["cand_id"].iloc[0], str):
-        probs_df["cand_id"] = _id_to_int(probs_df["cand_id"], validate=True)
+    # Load model for prediction
+    model_path = os.path.join(cache_dir, f"model_{version}.txt")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Missing trained model at {model_path}. Run s5_train.py first.")
+    print(f"Loading LightGBM model from {model_path} for chunk-wise validation prediction...")
+    booster = lgb.Booster(model_file=model_path)
 
-    # Merge emb_score if not present for tie-breaking
-    if "emb_score" not in probs_df.columns:
-        cand_chunks = [f for f in os.listdir(cache_dir) if f.startswith("cands_train_chunk_") and f.endswith(".parquet")]
-        expected_chunks = len(cand_chunks)
+    # Locate feature chunk files
+    cand_chunks = [f for f in os.listdir(cache_dir) if f.startswith("cands_train_chunk_") and f.endswith(".parquet")]
+    expected_chunks = len(cand_chunks)
 
-        feat_files = []
-        chunk_prefix = "feats_train_chunk_"
-        for f in os.listdir(cache_dir):
-            if f.startswith(chunk_prefix) and f.endswith(".parquet"):
-                feat_files.append(os.path.join(cache_dir, f))
+    feat_files = []
+    chunk_prefix = "feats_train_chunk_"
+    for f in os.listdir(cache_dir):
+        if f.startswith(chunk_prefix) and f.endswith(".parquet"):
+            feat_files.append(os.path.join(cache_dir, f))
 
-        if not feat_files:
-            raise FileNotFoundError(
-                f"No feature files found matching 'feats_train_chunk_*.parquet' in '{cache_dir}'. "
-                f"Run s4_features.py --split train first."
-            )
-
-        if expected_chunks > 0 and len(feat_files) < expected_chunks:
-            raise RuntimeError(
-                f"Incomplete feature chunks in '{cache_dir}': found {len(feat_files)} file(s) matching "
-                f"'feats_train_chunk_*.parquet', but expected {expected_chunks} (matching cands_train_chunk_*.parquet). "
-                f"Run s4_features.py --split train to complete feature extraction."
-            )
-
-        feat_files = sorted(
-            feat_files,
-            key=lambda x: int(re.search(r"chunk_(\d+)", os.path.basename(x)).group(1)) if re.search(r"chunk_(\d+)", os.path.basename(x)) else x
+    if not feat_files:
+        raise FileNotFoundError(
+            f"No feature files found matching 'feats_train_chunk_*.parquet' in '{cache_dir}'. "
+            f"Run s4_features.py --split train first."
         )
 
-        print("Merging emb_score from feature files for exact tie-breaking...")
-        val_s1_set = set(probs_df["s1_id"].unique())
-        emb_chunks = []
-        for fp in feat_files:
-            cdf = pd.read_parquet(fp, columns=["s1_id", "cand_id", "emb_score"])
-            # Convert IDs to int64
-            if cdf["s1_id"].dtype == object or isinstance(cdf["s1_id"].iloc[0], str):
-                cdf["s1_id"] = _id_to_int(cdf["s1_id"], validate=False)
-            # Keep only val/competitor S1 rows to avoid keeping train rows in memory
-            cdf = cdf[cdf["s1_id"].isin(val_s1_set)]
-            if len(cdf) > 0:
-                if cdf["cand_id"].dtype == object or isinstance(cdf["cand_id"].iloc[0], str):
-                    cdf["cand_id"] = _id_to_int(cdf["cand_id"], validate=False)
-                cdf["emb_score"] = cdf["emb_score"].astype(np.float32)
-                emb_chunks.append(cdf)
-        if emb_chunks:
-            all_emb_df = pd.concat(emb_chunks, ignore_index=True).drop_duplicates(subset=["s1_id", "cand_id"])
-            probs_df = probs_df.merge(all_emb_df, on=["s1_id", "cand_id"], how="left")
+    if expected_chunks > 0 and len(feat_files) < expected_chunks:
+        raise RuntimeError(
+            f"Incomplete feature chunks in '{cache_dir}': found {len(feat_files)} file(s) matching "
+            f"'feats_train_chunk_*.parquet', but expected {expected_chunks} (matching cands_train_chunk_*.parquet). "
+            f"Run s4_features.py --split train to complete feature extraction."
+        )
 
-    # Keep only needed columns with minimal dtypes (int64, float32, int8)
-    probs_df["s1_id"] = probs_df["s1_id"].astype(np.int64)
-    probs_df["cand_id"] = probs_df["cand_id"].astype(np.int64)
-    probs_df["prob"] = probs_df["prob"].astype(np.float32)
-    if "is_competitor" in probs_df.columns:
-        probs_df["is_competitor"] = probs_df["is_competitor"].astype(np.int8)
-    else:
-        probs_df["is_competitor"] = np.int8(0)
-    if "emb_score" in probs_df.columns:
-        probs_df["emb_score"] = probs_df["emb_score"].astype(np.float32)
+    feat_files = sorted(
+        feat_files,
+        key=lambda x: int(re.search(r"chunk_(\d+)", os.path.basename(x)).group(1)) if re.search(r"chunk_(\d+)", os.path.basename(x)) else x
+    )
 
-    keep_cols = ["s1_id", "cand_id", "prob", "is_competitor"]
-    if "emb_score" in probs_df.columns:
-        keep_cols.append("emb_score")
-    probs_df = probs_df[keep_cols].copy()
+    print(f"\nComputing predictions chunk-wise across {len(feat_files)} feature file(s) for val + competitor rows...", flush=True)
 
+    prob_chunks = []
+    read_cols = list(dict.fromkeys(["s1_id", "cand_id", "is_competitor", "emb_score"] + config.FEATURES))
+
+    for ci, fp in enumerate(feat_files):
+        t_cf = time.time()
+        cdf = pd.read_parquet(fp, columns=read_cols)
+
+        # Keep val S1 rows + competitor S1 rows
+        is_comp = cdf["is_competitor"].values == 1
+        is_val = cdf["s1_id"].isin(val_s1_set).values
+        keep_mask = is_comp | is_val
+
+        if not keep_mask.any():
+            del cdf
+            continue
+
+        eval_sub = cdf[keep_mask].reset_index(drop=True)
+        del cdf
+
+        # Predict probability
+        X_sub = eval_sub[config.FEATURES].values.astype(np.float32)
+        prob = booster.predict(X_sub)
+        del X_sub
+
+        # Encode IDs to int64
+        s1_enc = _id_to_int(eval_sub["s1_id"], validate=False)
+        cand_enc = _id_to_int(eval_sub["cand_id"], validate=False)
+
+        chunk_prob_df = pd.DataFrame({
+            "s1_id": s1_enc.astype(np.int64),
+            "cand_id": cand_enc.astype(np.int64),
+            "prob": prob.astype(np.float32),
+            "emb_score": eval_sub["emb_score"].values.astype(np.float32),
+            "is_competitor": eval_sub["is_competitor"].values.astype(np.int8)
+        })
+
+        prob_chunks.append(chunk_prob_df)
+
+        del eval_sub, prob, s1_enc, cand_enc
+        import gc; gc.collect()
+
+        print(f"  Chunk {ci + 1}/{len(feat_files)}: {len(chunk_prob_df):,} val+comp pairs predicted in {time.time() - t_cf:.2f}s (RSS {_rss_mb():.0f} MB)", flush=True)
+
+    probs_df = pd.concat(prob_chunks, ignore_index=True)
+    del prob_chunks
+    import gc; gc.collect()
+
+    probs_df.to_parquet(probs_path, index=False)
     mem_mb = probs_df.memory_usage(deep=True).sum() / 1_048_576
-    print(f"probs_df prepared: {len(probs_df):,} rows, {len(keep_cols)} cols ({probs_df.dtypes.to_dict()}) | Memory: {mem_mb:.1f} MB")
+    print(f"Saved {len(probs_df):,} total val + competitor probability rows to: {probs_path} | Memory: {mem_mb:.1f} MB (RSS {_rss_mb():.0f} MB)")
     return probs_df
 
 
@@ -264,6 +297,9 @@ def run_grid_search(
 
         s1_data = precompute_s1_candidates(df_eval)
         print(f"[{datetime.now().strftime('%H:%M:%S')}] After precompute_s1_candidates (ue={ue}, m={m:.2f}): s1_data={len(s1_data):,} entities | RSS: {_rss_mb():.1f} MB", flush=True)
+
+        del df_excl, df_eval
+        import gc; gc.collect()
 
         # Build valid (t1, te) pairs
         param_pairs = [(t1, te) for t1 in t_top1_vals for te in t_extra_vals if te >= t1]
@@ -591,8 +627,8 @@ def main():
     gold_map = build_gold_map(gt_df, val_s1)
     print(f"Full Gold Map constructed for {len(gold_map):,} entities (including singletons & blocking misses).")
 
-    # 2. Load validation probabilities (includes competitor rows)
-    probs_df = load_val_probabilities(cache_dir, args.version)
+    # 2. Load validation probabilities (includes competitor rows, computed chunk-by-chunk if not present)
+    probs_df = load_val_probabilities(cache_dir, args.version, set(val_s1))
     n_comp = int((probs_df.get("is_competitor", pd.Series([0])) == 1).sum())
     print(f"Loaded probability pairs: {len(probs_df):,} (Val: {len(probs_df) - n_comp:,}, Competitors: {n_comp:,})")
 

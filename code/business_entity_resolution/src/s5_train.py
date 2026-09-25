@@ -35,13 +35,19 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_dataset_features(cache_dir: str) -> pd.DataFrame:
+def load_train_and_val_data(
+    cache_dir: str,
+    split_map: Dict[str, str],
+    keep_train_metadata: bool = False
+) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, Optional[pd.DataFrame]]:
     """
-    Loads all train candidate feature parquet files from cache.
-    Unified naming pattern: feats_train_chunk_*.parquet
-    Raises FileNotFoundError if 0 files found.
-    Raises RuntimeError if fewer files found than expected candidate chunks.
-    Returns: concatenated DataFrame of candidate pairs with features.
+    Loads train and validation candidate features chunk-by-chunk from cache.
+    - Reads chunk files matching feats_train_chunk_*.parquet.
+    - Keeps ONLY is_competitor == 0 rows (completely skips competitor rows to save memory).
+    - For train rows: stores only float32 feature array X_train and int32 labels y_train.
+      Zero string IDs kept in memory for the ~1.2 crore train rows.
+    - For val rows: keeps val_df with needed columns for recall, sanity decisions, and rule baseline.
+    Returns: (X_train, y_train, val_df, train_meta_df_or_None)
     """
     cand_chunks = [f for f in os.listdir(cache_dir) if f.startswith("cands_train_chunk_") and f.endswith(".parquet")]
     expected_chunks = len(cand_chunks)
@@ -70,11 +76,74 @@ def load_dataset_features(cache_dir: str) -> pd.DataFrame:
         key=lambda x: int(re.search(r"chunk_(\d+)", os.path.basename(x)).group(1)) if re.search(r"chunk_(\d+)", os.path.basename(x)) else x
     )
 
-    print(f"Loading features from {len(feat_files)} file(s) (expected {expected_chunks})...")
-    dfs = [pd.read_parquet(fp) for fp in feat_files]
-    full_df = pd.concat(dfs, ignore_index=True)
-    print(f"Loaded {len(full_df):,} total feature pairs.")
-    return full_df
+    print(f"Loading candidate features chunk-by-chunk across {len(feat_files)} file(s) (expected {expected_chunks})...", flush=True)
+
+    read_cols = ["s1_id", "cand_id", "label", "is_competitor", "rule_score"] + config.FEATURES
+
+    X_train_parts = []
+    y_train_parts = []
+    val_parts = []
+    train_meta_parts = [] if keep_train_metadata else None
+
+    total_pairs_scanned = 0
+    total_train_rows = 0
+    total_val_rows = 0
+
+    for ci, fp in enumerate(feat_files):
+        t_cf = time.time()
+        cdf = pd.read_parquet(fp, columns=read_cols)
+        total_pairs_scanned += len(cdf)
+
+        # 1. Filter out competitor rows immediately
+        comp_mask = cdf["is_competitor"].values == 0
+        if not comp_mask.any():
+            del cdf
+            continue
+        cdf = cdf[comp_mask].reset_index(drop=True)
+
+        # 2. Map fold from split_map
+        fold = cdf["s1_id"].map(split_map).values
+
+        # 3. Train rows: keep ONLY float32 features and int label, NO string IDs
+        is_train = fold == "train"
+        if is_train.any():
+            X_tr = cdf.loc[is_train, config.FEATURES].values.astype(np.float32)
+            y_tr = cdf.loc[is_train, "label"].values.astype(np.int32)
+            X_train_parts.append(X_tr)
+            y_train_parts.append(y_tr)
+            total_train_rows += len(X_tr)
+            if keep_train_metadata:
+                train_meta_parts.append(cdf.loc[is_train, ["s1_id", "cand_id", "label"]])
+
+        # 4. Val rows: keep val_df with needed columns
+        is_val = fold == "val"
+        if is_val.any():
+            val_cols = ["s1_id", "cand_id", "label", "rule_score"] + config.FEATURES
+            val_chunk = cdf.loc[is_val, val_cols].copy()
+            for fc in config.FEATURES:
+                val_chunk[fc] = val_chunk[fc].astype(np.float32)
+            val_chunk["label"] = val_chunk["label"].astype(np.int32)
+            val_chunk["rule_score"] = val_chunk["rule_score"].astype(np.float32)
+            val_parts.append(val_chunk)
+            total_val_rows += len(val_chunk)
+
+        del cdf
+        import gc; gc.collect()
+
+    print(f"Loaded {total_pairs_scanned:,} total scanned pairs -> {total_train_rows:,} train pairs, {total_val_rows:,} val pairs.")
+
+    X_train = np.vstack(X_train_parts) if X_train_parts else np.empty((0, len(config.FEATURES)), dtype=np.float32)
+    y_train = np.concatenate(y_train_parts) if y_train_parts else np.empty((0,), dtype=np.int32)
+    del X_train_parts, y_train_parts
+    import gc; gc.collect()
+
+    val_df = pd.concat(val_parts, ignore_index=True) if val_parts else pd.DataFrame()
+    del val_parts
+    import gc; gc.collect()
+
+    train_meta_df = pd.concat(train_meta_parts, ignore_index=True) if keep_train_metadata and train_meta_parts else None
+
+    return X_train, y_train, val_df, train_meta_df
 
 
 def train_lgb_model(
@@ -369,18 +438,12 @@ def main():
     val_gold_map = build_gold_map(gt_df, val_s1_ids)
     print(f"Constructed full Val Gold Map: {len(val_gold_map):,} entities (including singletons & missed blocking).")
 
-    # 3. Load feature dataset
-    feats_df = load_dataset_features(cache_dir)
-    feats_df["fold"] = feats_df["s1_id"].map(split_map)
+    # 3. Load feature dataset chunk-by-chunk (keep only is_competitor == 0, zero string IDs for train)
+    X_train, y_train, val_df, train_meta_df = load_train_and_val_data(
+        cache_dir, split_map, keep_train_metadata=args.proxy
+    )
 
-    # Verify no competitor rows used in training
-    train_mask = (feats_df["is_competitor"] == 0) & (feats_df["fold"] == "train")
-    val_mask = (feats_df["is_competitor"] == 0) & (feats_df["fold"] == "val")
-
-    train_df = feats_df[train_mask].reset_index(drop=True)
-    val_df = feats_df[val_mask].reset_index(drop=True)
-
-    print(f"Train candidate pairs (is_competitor=0): {len(train_df):,} (pos: {(train_df['label'] == 1).sum():,}, neg: {(train_df['label'] == 0).sum():,})")
+    print(f"Train candidate pairs (is_competitor=0): {len(X_train):,} (pos: {(y_train == 1).sum():,}, neg: {(y_train == 0).sum():,})")
     print(f"Val candidate pairs   (is_competitor=0): {len(val_df):,} (pos: {(val_df['label'] == 1).sum():,}, neg: {(val_df['label'] == 0).sum():,})")
 
     # Calculate Candidate Pair Recall on Val
@@ -392,10 +455,7 @@ def main():
         val_recall = (found_count / max(1, len(val_gt))) * 100.0
         print(f"Val Candidate Pair Recall@cands: {found_count} / {len(val_gt)} ({val_recall:.2f}%)")
 
-    # 4. Prepare feature matrices
-    X_train = train_df[config.FEATURES].values.astype(np.float32)
-    y_train = train_df["label"].values.astype(int)
-
+    # 4. Prepare val feature matrix
     X_val = val_df[config.FEATURES].values.astype(np.float32)
     y_val = val_df["label"].values.astype(int)
 
@@ -431,21 +491,8 @@ def main():
     feat_imp_path = os.path.join(cache_dir, f"feature_importance_{args.version}.csv")
     compute_feature_importance(booster, config.FEATURES, feat_imp_path)
 
-    # 9. Predict probabilities for val S1 AND competitor S1 and save to cache/val_probs_<version>.parquet
-    eval_mask = (feats_df["fold"] == "val") | (feats_df["is_competitor"] == 1)
-    eval_df = feats_df[eval_mask].copy().reset_index(drop=True)
-    print(f"\nPredicting probabilities for val + competitor pairs: {len(eval_df):,} pairs...")
-    X_eval = eval_df[config.FEATURES].values.astype(np.float32)
-    eval_df["prob"] = booster.predict(X_eval)
-
-    val_probs_path = os.path.join(cache_dir, f"val_probs_{args.version}.parquet")
-    save_cols = ["s1_id", "cand_id", "prob", "is_competitor"]
-    eval_df[save_cols].to_parquet(val_probs_path, index=False)
-    print(f"Saved evaluation probabilities to: {val_probs_path}")
-
-    # 10. Quick sanity decision (top-1 if prob >= 0.5, extras if prob >= 0.8, no exclusivity)
-    val_pred_probs = eval_df[eval_df["is_competitor"] == 0]["prob"].values
-    val_sanity_preds = predict_sanity_decisions(val_df, val_pred_probs, t_top1=0.5, t_extra=0.8)
+    # 9. Quick sanity decision (top-1 if prob >= 0.5, extras if prob >= 0.8, no exclusivity)
+    val_sanity_preds = predict_sanity_decisions(val_df, val_preds, t_top1=0.5, t_extra=0.8)
     val_macro_f05 = macro_f05(val_sanity_preds, val_gold_map)
     print("\n" + "=" * 50)
     print(f"LightGBM Sanity Decision Val Macro F0.5: {val_macro_f05:.4f}")
