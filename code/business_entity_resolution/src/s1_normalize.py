@@ -153,9 +153,31 @@ def extract_street_token(tokens, house_no_idx=-1):
                 return t
     return ""
 
+def extract_aka_names(raw_name):
+    """
+    Extracts alternative name parts split by ' a k a ', ' aka ', or ' dba '.
+    Returns: tuple of (name_aka_a, name_aka_b) normalized core strings.
+    """
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        return "", ""
+    n = raw_name.lower()
+    for sep in [' a k a ', ' aka ', ' dba ']:
+        if sep in n:
+            parts = n.split(sep, 1)
+            p_a = parts[0].strip()
+            p_b = parts[1].strip()
+            norm_a = normalize_name(p_a)[3]
+            norm_b = normalize_name(p_b)[3]
+            return norm_a, norm_b
+    return "", ""
+
 def normalize_address(raw_addr):
+    """
+    Normalizes address, strips leading zeros from all numeric tokens,
+    extracts house candidates, numeric tokens, zip/pin, and street token.
+    """
     if not isinstance(raw_addr, str) or not raw_addr.strip() or raw_addr.strip().lower() == "null":
-        return "", "", "", 0, "", "", "", 1, ""
+        return "", "", "", 0, "", "", "", 1, "", ""
         
     a = raw_addr
     a = NO_PREFIX_RE.sub(' ', a)
@@ -167,6 +189,8 @@ def normalize_address(raw_addr):
     norm_tokens = []
     for t in tokens:
         mapped = ADDR_ABBREVIATIONS.get(t, t)
+        if mapped.isdigit():
+            mapped = mapped.lstrip('0') or '0'
         norm_tokens.append(mapped)
         
     addr_tokens = []
@@ -180,9 +204,14 @@ def normalize_address(raw_addr):
             addr_tokens.append(t)
             
     for t in addr_tokens:
-        if any(c.isdigit() for c in t):
-            num_tokens.append(t.lstrip('0') or '0') 
-            
+        if t.isdigit():
+            num_tokens.append(t.lstrip('0') or '0')
+        elif any(c.isdigit() for c in t):
+            digits_sub = re.findall(r'\d+', t)
+            for d in digits_sub:
+                num_tokens.append(d.lstrip('0') or '0')
+                
+    num_tokens = list(dict.fromkeys(num_tokens))
     addr_norm = " ".join(addr_tokens)
     unit_toks_str = " ".join(unit_tokens)
     num_toks_str = " ".join(num_tokens)
@@ -194,27 +223,33 @@ def normalize_address(raw_addr):
     house_no_idx_in_addr = -1
     for i, rt in enumerate(raw_tokens):
         if any(c.isdigit() for c in rt):
-            if "#" in rt:
-                digits_only = "".join(c for c in rt if c.isdigit())
-                if digits_only:
-                    house_no = digits_only.lstrip("0") or "0"
+            digits_only = "".join(c for c in rt if c.isdigit())
+            if digits_only:
+                house_no = digits_only.lstrip("0") or "0"
+                if "#" in rt:
                     house_masked = 1
-                    # find approx index in addr_tokens
-                    # we just match by finding the first token that contains these digits
-                    break
-            else:
-                digits_only = "".join(c for c in rt if c.isdigit())
-                if digits_only:
-                    house_no = digits_only.lstrip("0") or "0"
-                    break
-                    
-    # For street_token extraction, find index of house_no in addr_tokens
+                break
+                
     for i, t in enumerate(addr_tokens):
-        if any(c.isdigit() for c in t) and (t.lstrip('0') or '0') == house_no:
+        if t.isdigit() and (t.lstrip('0') or '0') == house_no:
             house_no_idx_in_addr = i
             break
             
     street_token = extract_street_token(addr_tokens, house_no_idx_in_addr)
+    
+    # House candidates: any number directly followed by an alphabetic token of 3+ letters
+    house_cands = []
+    for i in range(len(addr_tokens) - 1):
+        cur = addr_tokens[i]
+        nxt = addr_tokens[i + 1]
+        if cur.isdigit() and nxt.isalpha() and len(nxt) >= 3:
+            clean_n = cur.lstrip('0') or '0'
+            cand = f"{clean_n}_{nxt}"
+            if cand not in house_cands:
+                house_cands.append(cand)
+                if len(house_cands) >= 3:
+                    break
+    house_cands_str = ";".join(house_cands)
     
     zip_pin = ""
     for t in reversed(tokens):
@@ -235,7 +270,7 @@ def normalize_address(raw_addr):
             
     addr_missing = 1 if not addr_norm else 0
     
-    return addr_norm, unit_toks_str, house_no, house_masked, num_toks_str, zip_pin, state_code, addr_missing, street_token
+    return addr_norm, unit_toks_str, house_no, house_masked, num_toks_str, zip_pin, state_code, addr_missing, street_token, house_cands_str
 
 def process_chunk(df_chunk):
     results = []
@@ -246,7 +281,8 @@ def process_chunk(df_chunk):
         raw_addr = row.get("business_address", "")
         
         n_full, n_a, n_b, core, legal, c_sorted, skel = normalize_name(raw_name)
-        a_norm, a_unit, h_no, h_mask, num_tok, z_pin, st_code, a_miss, st_tok = normalize_address(raw_addr)
+        a_norm, a_unit, h_no, h_mask, num_tok, z_pin, st_code, a_miss, st_tok, h_cands = normalize_address(raw_addr)
+        aka_a, aka_b = extract_aka_names(raw_name)
         
         if not n_full and raw_name and str(raw_name).strip():
             fallback = transliterate_if_needed(raw_name).lower()
@@ -264,6 +300,8 @@ def process_chunk(df_chunk):
             "name_full": n_full,
             "name_a": n_a,
             "name_b": n_b,
+            "name_aka_a": aka_a,
+            "name_aka_b": aka_b,
             "core_name": core,
             "legal": legal,
             "core_sorted": c_sorted,
@@ -277,9 +315,11 @@ def process_chunk(df_chunk):
             "zip_pin": z_pin,
             "state_code": st_code,
             "addr_missing": a_miss,
-            "street_token": st_tok
+            "street_token": st_tok,
+            "house_cands": h_cands
         })
     return pd.DataFrame(results)
+
 
 def normalize_file(file_path, out_path):
     print(f"Processing {file_path}...")

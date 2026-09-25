@@ -121,44 +121,52 @@ def main():
     norm_s3.to_parquet(os.path.join(laptop_dir, "norm_train_source3.parquet"), index=False)
     print("All normalized Parquet files written to cache/laptop_test/")
 
-    # 7. Embed using Qwen3 model
-    if torch.cuda.is_available():
-        device = "cuda"
-        torch_dtype = torch.float16
-    elif torch.backends.mps.is_available():
-        device = "mps"
-        torch_dtype = torch.float32
-    else:
-        device = "cpu"
-        torch_dtype = torch.float32
-
-    print(f"\nLoading Qwen3-Embedding-0.6B on {device} ({torch_dtype})...")
-    model = SentenceTransformer(
-        "Qwen/Qwen3-Embedding-0.6B",
-        device=device,
-        model_kwargs={"torch_dtype": torch_dtype},
-        truncate_dim=256,
+    # 7. Embed using Qwen3 model only if missing
+    all_embs_exist = all(
+        os.path.exists(os.path.join(laptop_dir, f"emb_train_{src}.npy")) and
+        os.path.exists(os.path.join(laptop_dir, f"emb_train_{src}_alt.npy"))
+        for src in ["source1", "source2", "source3"]
     )
-    model.max_seq_length = 48
+    if all_embs_exist:
+        print("\nAll embeddings in cache/laptop_test already exist, skipping re-embedding!")
+    else:
+        if torch.cuda.is_available():
+            device = "cuda"
+            torch_dtype = torch.float16
+        elif torch.backends.mps.is_available():
+            device = "mps"
+            torch_dtype = torch.float32
+        else:
+            device = "cpu"
+            torch_dtype = torch.float32
 
-    for src_name, norm_df in [("source1", norm_s1), ("source2", norm_s2), ("source3", norm_s3)]:
-        print(f"\n=== Embedding {src_name} ({len(norm_df)} rows) ===")
-        raw_names = norm_df['raw_name'].fillna("").astype(str).values
-        name_fulls = norm_df['name_full'].fillna("").astype(str).values
-        entity_ids = norm_df['entity_id'].values
+        print(f"\nLoading Qwen3-Embedding-0.6B on {device} ({torch_dtype})...")
+        model = SentenceTransformer(
+            "Qwen/Qwen3-Embedding-0.6B",
+            device=device,
+            model_kwargs={"torch_dtype": torch_dtype},
+            truncate_dim=256,
+        )
+        model.max_seq_length = 48
 
-        is_non_ascii = np.array([has_non_ascii(t) for t in raw_names])
-        main_texts = np.where(is_non_ascii, raw_names, name_fulls)
-        alt_texts = name_fulls[is_non_ascii]
-        alt_ids = entity_ids[is_non_ascii]
+        for src_name, norm_df in [("source1", norm_s1), ("source2", norm_s2), ("source3", norm_s3)]:
+            print(f"\n=== Embedding {src_name} ({len(norm_df)} rows) ===")
+            raw_names = norm_df['raw_name'].fillna("").astype(str).values
+            name_fulls = norm_df['name_full'].fillna("").astype(str).values
+            entity_ids = norm_df['entity_id'].values
 
-        # Use laptop_dir as destination
-        tag_prefix = f"train_{src_name}"
-        emb_prefix_main = os.path.join(laptop_dir, f"emb_{tag_prefix}")
-        encode_uniques_and_save(model, main_texts, entity_ids, emb_prefix_main, f"{tag_prefix}_main", batch_size=512)
+            is_non_ascii = np.array([has_non_ascii(t) for t in raw_names])
+            main_texts = np.where(is_non_ascii, raw_names, name_fulls)
+            alt_texts = name_fulls[is_non_ascii]
+            alt_ids = entity_ids[is_non_ascii]
 
-        emb_prefix_alt = os.path.join(laptop_dir, f"emb_{tag_prefix}_alt")
-        encode_uniques_and_save(model, alt_texts, alt_ids, emb_prefix_alt, f"{tag_prefix}_alt", batch_size=512)
+            tag_prefix = f"train_{src_name}"
+            emb_prefix_main = os.path.join(laptop_dir, f"emb_{tag_prefix}")
+            encode_uniques_and_save(model, main_texts, entity_ids, emb_prefix_main, f"{tag_prefix}_main", batch_size=512)
+
+            emb_prefix_alt = os.path.join(laptop_dir, f"emb_{tag_prefix}_alt")
+            encode_uniques_and_save(model, alt_texts, alt_ids, emb_prefix_alt, f"{tag_prefix}_alt", batch_size=512)
+
 
     print("\n[laptop_test] All embeddings and data successfully created!")
 
