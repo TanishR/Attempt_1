@@ -36,7 +36,44 @@ EMB_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 T_TOP1 = None
 T_EXTRA = None
 EXCL_MARGIN = 0.0
-FEATURES = []
+FEATURES = [
+    # Embedding & Rank
+    "emb_score",
+    "emb_rank",
+    # Name Similarity
+    "name_token_sort",
+    "name_token_set",
+    "core_ratio",
+    "core_partial",
+    "skel_ratio",
+    "name_jaccard",
+    "legal_match",
+    "dba_max",
+    "aka_max",
+    "len_diff",
+    # Address Similarity & Matching
+    "addr_token_set",
+    "house_match",
+    "house_cand_match",
+    "num_jaccard",
+    "rare_tok_overlap",
+    "zip_match",
+    "state_match",
+    "addr_missing_any",
+    # Channel & Source Flags
+    "cand_source",
+    "ch_emb",
+    "ch_addr",
+    "ch_skel",
+    "ch_rare",
+    "ch_rev",
+    "n_channels",
+    # Context Features
+    "gap_to_best",
+    "n_cands",
+    "reverse_rank",
+    "support",
+]
 
 def load_tsv(path):
     """

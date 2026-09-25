@@ -750,10 +750,10 @@ def main():
             chunk_df = chunk_df.groupby(['s1_id', 'cand_id']).agg(agg_chunk).reset_index()
             chunk_df[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev']] = chunk_df[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev']].fillna(0).astype(int)
             
-            # Cap candidates per S1 to max(50, CAND_CAP), prioritizing symbolic address blocks
+            # Cap candidates per S1 to CAND_CAP, prioritizing symbolic address blocks
             is_sym = (chunk_df['ch_addr'] == 1) | (chunk_df['ch_skel'] == 1) | (chunk_df['ch_rare'] == 1)
             chunk_df = chunk_df.assign(is_sym=is_sym).sort_values(['s1_id', 'is_sym', 'emb_score'], ascending=[True, False, False]).drop(columns=['is_sym'])
-            chunk_df = chunk_df.groupby('s1_id').head(max(50, CAND_CAP)).reset_index(drop=True)
+            chunk_df = chunk_df.groupby('s1_id').head(CAND_CAP).reset_index(drop=True)
             
         # Add label column if ground truth exists
         if gt_df is not None:
