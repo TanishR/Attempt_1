@@ -564,228 +564,251 @@ def main():
     print(f"Split: {args.split}")
     print(f"K_PER_SOURCE={K_PER_SOURCE}, CAND_CAP={CAND_CAP}, MAX_BLOCK_SIZE={MAX_BLOCK_SIZE}")
 
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"
-    else:
-        device = "cpu"
-    print(f"Compute Device: {device}")
-
-    # Load S1 keys and embeddings
-    print("\nLoading Source 1 keys and embeddings...")
-    s1_keys_df = load_blocking_keys(cache_dir, args.split, "source1")
-    s1_m_emb, s1_m_map, s1_m_ids, s1_a_emb, s1_a_map, s1_a_ids = load_embedding_arrays(cache_dir, args.split, "source1")
-    
-    if len(s1_m_ids) == 0:
-        print("Error: Source 1 embeddings not found. Please run Step 4 first.")
-        return
-
-    # Load S2 and S3 keys and embeddings
-    print("Loading Source 2 & 3 keys and embeddings...")
-    c2_keys_df = load_blocking_keys(cache_dir, args.split, "source2")
-    c2_m_emb, c2_m_map, c2_m_ids, c2_a_emb, c2_a_map, c2_a_ids = load_embedding_arrays(cache_dir, args.split, "source2")
-    
-    c3_keys_df = load_blocking_keys(cache_dir, args.split, "source3")
-    c3_m_emb, c3_m_map, c3_m_ids, c3_a_emb, c3_a_map, c3_a_ids = load_embedding_arrays(cache_dir, args.split, "source3")
-
-    # Document frequency of address tokens (len >= 5) across S1+S2+S3 for Channel E
-    print("Computing address token document frequencies across S1+S2+S3...")
-    df_tokens = compute_address_token_df(s1_keys_df, c2_keys_df, c3_keys_df)
-    c2_e_keys = build_channel_e_keys(c2_keys_df, df_tokens)
-    c3_e_keys = build_channel_e_keys(c3_keys_df, df_tokens)
-
-    # Channel D (Reverse Search): compute top-3 S1 per S2 and S3 record within country
-    print("Running Channel D (Reverse Embedding Search: top-3 S1 per S2/S3 record)...")
-    rev_cands_s2 = search_channel_d_reverse_gpu(
-        s1_keys_df, c2_keys_df, s1_m_emb, s1_m_map, s1_m_ids, s1_a_emb, s1_a_map, s1_a_ids,
-        c2_m_emb, c2_m_map, c2_a_emb, c2_a_map, 3, device, 0
-    )
-    rev_cands_s3 = search_channel_d_reverse_gpu(
-        s1_keys_df, c3_keys_df, s1_m_emb, s1_m_map, s1_m_ids, s1_a_emb, s1_a_map, s1_a_ids,
-        c3_m_emb, c3_m_map, c3_a_emb, c3_a_map, 3, device, 1
-    )
-    all_rev_cands = pd.concat([rev_cands_s2, rev_cands_s3], ignore_index=True)
-    all_rev_cands['emb_rank'] = 999
-    all_rev_cands['ch_emb'] = 0
-    all_rev_cands['ch_addr'] = 0
-    all_rev_cands['ch_skel'] = 0
-    all_rev_cands['ch_rare'] = 0
-
-    # Load GT for label assignment if train/val split
-    gt_df = None
-    if args.split == "train":
-        gt_path = os.path.join(cache_dir, "gt_long.parquet")
-        if os.path.exists(gt_path):
-            gt_df = pd.read_parquet(gt_path)
-            print(f"Loaded ground truth: {len(gt_df)} rows")
-
-    # Partition S1 into chunks of args.chunk_size (100k queries) with resume
-    # NOTE: For split=train, this is ALL S1 from the norm file (not just the sampled
-    # train/val split). This ensures Channel D, reverse_rank and exclusivity see
-    # realistic competition matching the test-time distribution.
-    all_s1_ids = s1_keys_df['entity_id'].values
-    chunk_size = args.chunk_size
-    num_chunks = (len(all_s1_ids) + chunk_size - 1) // chunk_size
-    print(f"\nProcessing {len(all_s1_ids)} S1 queries in {num_chunks} chunk(s) of {chunk_size}...")
-
-    chunk_files = []
     start_total_time = time.time()
 
-    for ch_idx in range(num_chunks):
-        chunk_out_path = os.path.join(cache_dir, f"cands_{args.split}_chunk_{ch_idx}.parquet")
-        chunk_files.append(chunk_out_path)
-        
-        if os.path.exists(chunk_out_path):
-            print(f"Chunk {ch_idx + 1}/{num_chunks} already exists ({chunk_out_path}), skipping...", flush=True)
-            continue
+    # Compute expected number of chunks from S1 count and chunk size
+    norm_s1_path = os.path.join(cache_dir, f"norm_{args.split}_source1.parquet")
+    if not os.path.exists(norm_s1_path):
+        print(f"Error: Normalized source1 file not found: {norm_s1_path}")
+        return
 
-        elapsed_so_far = time.time() - start_total_time
-        rss = _rss_mb()
-        print(f"\n>>> Processing Chunk {ch_idx + 1}/{num_chunks}  (elapsed {elapsed_so_far:.0f}s, RSS {rss:.0f} MB)", flush=True)
-        c_s1_ids = all_s1_ids[ch_idx * chunk_size : (ch_idx + 1) * chunk_size]
-        sub_s1_keys = s1_keys_df[s1_keys_df['entity_id'].isin(c_s1_ids)].copy()
-        
-        chunk_cands_list = []
-        
-        # Sources to block against
-        cand_sources = [
-            ("source2", 0, c2_keys_df, c2_e_keys, c2_m_emb, c2_m_map, c2_m_ids, c2_a_emb, c2_a_map, c2_a_ids),
-            ("source3", 1, c3_keys_df, c3_e_keys, c3_m_emb, c3_m_map, c3_m_ids, c3_a_emb, c3_a_map, c3_a_ids)
-        ]
-        
-        countries = sub_s1_keys['country'].dropna().unique() if BLOCK_BY_COUNTRY else ["ALL"]
-        
-        for src_name, src_code, c_keys_df, c_e_keys, c_m_emb, c_m_map, c_m_ids, c_a_emb, c_a_map, c_a_ids in cand_sources:
-            if len(c_m_ids) == 0: continue
-            
-            for country in countries:
-                if BLOCK_BY_COUNTRY:
-                    s1_c_df = sub_s1_keys[sub_s1_keys['country'] == country]
-                    c_c_df = c_keys_df[c_keys_df['country'] == country]
-                else:
-                    s1_c_df = sub_s1_keys
-                    c_c_df = c_keys_df
-                    
-                s1_c_ids = s1_c_df['entity_id'].values
-                cand_c_ids = c_c_df['entity_id'].values
-                
-                if len(s1_c_ids) == 0 or len(cand_c_ids) == 0:
-                    continue
-                    
-                # --- Channel A: GPU Embedding Search ---
-                df_a = search_channel_a_gpu(
-                    s1_c_ids, s1_m_emb, s1_m_map, s1_a_emb, s1_a_map,
-                    cand_c_ids, c_m_emb, c_m_map, c_a_emb, c_a_map,
-                    args.k_channel_a, device
-                )
-                
-                # --- Channel B: Address Hash Join (v2) ---
-                s1_b_keys = build_channel_b_keys(s1_c_df)
-                c_b_keys = build_channel_b_keys(c_c_df)
-                if not s1_b_keys.empty and not c_b_keys.empty:
-                    valid_b = get_valid_keys(c_b_keys, 'b_key', MAX_BLOCK_SIZE)
-                    s1_b_valid = s1_b_keys[s1_b_keys['b_key'].isin(valid_b)]
-                    c_b_valid = c_b_keys[c_b_keys['b_key'].isin(valid_b)]
-                    df_b = s1_b_valid.merge(c_b_valid, on='b_key').rename(
-                        columns={'entity_id_x': 's1_id', 'entity_id_y': 'cand_id'}
-                    )[['s1_id', 'cand_id']].drop_duplicates()
-                    df_b = df_b.groupby('s1_id').head(MAX_ADDR_CANDS).reset_index(drop=True)
-                    df_b['ch_addr'] = 1
-                else:
-                    df_b = pd.DataFrame(columns=['s1_id', 'cand_id', 'ch_addr'])
-                
-                # --- Channel C: Name Skeleton Hash Join ---
-                s1_c_keys = build_channel_c_keys(s1_c_df)
-                c_c_keys = build_channel_c_keys(c_c_df)
-                if not s1_c_keys.empty and not c_c_keys.empty:
-                    valid_c = get_valid_keys(c_c_keys, 'c_key', MAX_BLOCK_SIZE)
-                    s1_c_valid = s1_c_keys[s1_c_keys['c_key'].isin(valid_c)]
-                    c_c_valid = c_c_keys[c_c_keys['c_key'].isin(valid_c)]
-                    df_c = s1_c_valid.merge(c_c_valid, on='c_key').rename(
-                        columns={'entity_id_x': 's1_id', 'entity_id_y': 'cand_id'}
-                    )[['s1_id', 'cand_id']].drop_duplicates()
-                    df_c = df_c.groupby('s1_id').head(MAX_SKEL_CANDS).reset_index(drop=True)
-                    df_c['ch_skel'] = 1
-                else:
-                    df_c = pd.DataFrame(columns=['s1_id', 'cand_id', 'ch_skel'])
+    try:
+        import pyarrow.parquet as pq
+        s1_count = pq.read_metadata(norm_s1_path).num_rows
+    except Exception:
+        s1_count = len(pd.read_parquet(norm_s1_path, columns=['entity_id']))
 
-                # --- Channel E: Rare Address Tokens ---
-                s1_e_keys = build_channel_e_keys(s1_c_df, df_tokens)
-                c_e_keys_c = c_e_keys[c_e_keys['entity_id'].isin(cand_c_ids)]
-                if not s1_e_keys.empty and not c_e_keys_c.empty:
-                    valid_e = get_valid_keys(c_e_keys_c, 'e_key', MAX_BLOCK_SIZE)
-                    s1_e_valid = s1_e_keys[s1_e_keys['e_key'].isin(valid_e)]
-                    c_e_valid = c_e_keys_c[c_e_keys_c['e_key'].isin(valid_e)]
-                    df_e = s1_e_valid.merge(c_e_valid, on='e_key').rename(
-                        columns={'entity_id_x': 's1_id', 'entity_id_y': 'cand_id'}
-                    )[['s1_id', 'cand_id']].drop_duplicates()
-                    df_e = df_e.groupby('s1_id').head(MAX_RARE_CANDS).reset_index(drop=True)
-                    df_e['ch_rare'] = 1
-                else:
-                    df_e = pd.DataFrame(columns=['s1_id', 'cand_id', 'ch_rare'])
+    chunk_size = args.chunk_size
+    num_chunks = (s1_count + chunk_size - 1) // chunk_size
+    print(f"Expected chunks for {s1_count:,} S1 queries (chunk_size={chunk_size:,}): {num_chunks}")
 
-                # --- Union Channels A, B, C, E ---
-                merged_cands = pd.concat([df_a, df_b, df_c, df_e], ignore_index=True)
-                if merged_cands.empty:
-                    continue
-                    
-                agg_dict = {
-                    'ch_emb': 'max', 'ch_addr': 'max', 'ch_skel': 'max', 'ch_rare': 'max',
-                    'emb_score': 'max', 'emb_rank': 'min'
-                }
-                merged_cands = merged_cands.groupby(['s1_id', 'cand_id']).agg(agg_dict).reset_index()
-                merged_cands[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare']] = merged_cands[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare']].fillna(0).astype(int)
-                
-                # Compute missing emb_score for non-Channel A candidates
-                missing_mask = merged_cands['emb_score'].isna()
-                if missing_mask.any():
-                    df_miss = merged_cands[missing_mask]
-                    missing_scores = compute_missing_scores_vectorized(
-                        df_miss, s1_m_emb, s1_m_map, s1_a_emb, s1_a_map,
-                        c_m_emb, c_m_map, c_a_emb, c_a_map
-                    )
-                    merged_cands.loc[missing_mask, 'emb_score'] = missing_scores
-                    merged_cands.loc[missing_mask, 'emb_rank'] = 999
-                    
-                merged_cands['cand_source'] = src_code
-                chunk_cands_list.append(merged_cands)
-                
-        # Append Channel D reverse candidates for S1 in this chunk
-        df_d_chunk = all_rev_cands[all_rev_cands['s1_id'].isin(c_s1_ids)].copy()
-        if not df_d_chunk.empty:
-            chunk_cands_list.append(df_d_chunk)
-            
-        if not chunk_cands_list:
-            chunk_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank', 'ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev'])
+    chunk_files = [
+        os.path.join(cache_dir, f"cands_{args.split}_chunk_{ch_idx}.parquet")
+        for ch_idx in range(num_chunks)
+    ]
+    all_chunks_exist = len(chunk_files) > 0 and all(os.path.exists(cp) for cp in chunk_files)
+
+    gt_df = None
+    if all_chunks_exist:
+        print(f"All {num_chunks} chunks exist, skipping candidate generation", flush=True)
+        if args.split == "train":
+            gt_path = os.path.join(cache_dir, "gt_long.parquet")
+            if os.path.exists(gt_path):
+                gt_df = pd.read_parquet(gt_path)
+                print(f"Loaded ground truth: {len(gt_df)} rows")
+    else:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
         else:
-            chunk_df = pd.concat(chunk_cands_list, ignore_index=True)
-            agg_chunk = {
-                'ch_emb': 'max', 'ch_addr': 'max', 'ch_skel': 'max', 'ch_rare': 'max', 'ch_rev': 'max',
-                'emb_score': 'max', 'emb_rank': 'min', 'cand_source': 'first'
-            }
-            chunk_df = chunk_df.groupby(['s1_id', 'cand_id']).agg(agg_chunk).reset_index()
-            chunk_df[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev']] = chunk_df[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev']].fillna(0).astype(int)
+            device = "cpu"
+        print(f"Compute Device: {device}")
+
+        # Load S1 keys and embeddings
+        print("\nLoading Source 1 keys and embeddings...")
+        s1_keys_df = load_blocking_keys(cache_dir, args.split, "source1")
+        s1_m_emb, s1_m_map, s1_m_ids, s1_a_emb, s1_a_map, s1_a_ids = load_embedding_arrays(cache_dir, args.split, "source1")
+        
+        if len(s1_m_ids) == 0:
+            print("Error: Source 1 embeddings not found. Please run Step 4 first.")
+            return
+
+        # Load S2 and S3 keys and embeddings
+        print("Loading Source 2 & 3 keys and embeddings...")
+        c2_keys_df = load_blocking_keys(cache_dir, args.split, "source2")
+        c2_m_emb, c2_m_map, c2_m_ids, c2_a_emb, c2_a_map, c2_a_ids = load_embedding_arrays(cache_dir, args.split, "source2")
+        
+        c3_keys_df = load_blocking_keys(cache_dir, args.split, "source3")
+        c3_m_emb, c3_m_map, c3_m_ids, c3_a_emb, c3_a_map, c3_a_ids = load_embedding_arrays(cache_dir, args.split, "source3")
+
+        # Document frequency of address tokens (len >= 5) across S1+S2+S3 for Channel E
+        print("Computing address token document frequencies across S1+S2+S3...")
+        df_tokens = compute_address_token_df(s1_keys_df, c2_keys_df, c3_keys_df)
+        c2_e_keys = build_channel_e_keys(c2_keys_df, df_tokens)
+        c3_e_keys = build_channel_e_keys(c3_keys_df, df_tokens)
+
+        # Channel D (Reverse Search): compute top-3 S1 per S2 and S3 record within country
+        print("Running Channel D (Reverse Embedding Search: top-3 S1 per S2/S3 record)...")
+        rev_cands_s2 = search_channel_d_reverse_gpu(
+            s1_keys_df, c2_keys_df, s1_m_emb, s1_m_map, s1_m_ids, s1_a_emb, s1_a_map, s1_a_ids,
+            c2_m_emb, c2_m_map, c2_a_emb, c2_a_map, 3, device, 0
+        )
+        rev_cands_s3 = search_channel_d_reverse_gpu(
+            s1_keys_df, c3_keys_df, s1_m_emb, s1_m_map, s1_m_ids, s1_a_emb, s1_a_map, s1_a_ids,
+            c3_m_emb, c3_m_map, c3_a_emb, c3_a_map, 3, device, 1
+        )
+        all_rev_cands = pd.concat([rev_cands_s2, rev_cands_s3], ignore_index=True)
+        all_rev_cands['emb_rank'] = 999
+        all_rev_cands['ch_emb'] = 0
+        all_rev_cands['ch_addr'] = 0
+        all_rev_cands['ch_skel'] = 0
+        all_rev_cands['ch_rare'] = 0
+
+        # Load GT for label assignment if train/val split
+        if args.split == "train":
+            gt_path = os.path.join(cache_dir, "gt_long.parquet")
+            if os.path.exists(gt_path):
+                gt_df = pd.read_parquet(gt_path)
+                print(f"Loaded ground truth: {len(gt_df)} rows")
+
+        # Partition S1 into chunks of args.chunk_size (100k queries) with resume
+        all_s1_ids = s1_keys_df['entity_id'].values
+        print(f"\nProcessing {len(all_s1_ids)} S1 queries in {num_chunks} chunk(s) of {chunk_size}...")
+
+        for ch_idx in range(num_chunks):
+            chunk_out_path = chunk_files[ch_idx]
             
-            # Cap candidates per S1 to CAND_CAP, prioritizing symbolic address blocks
-            is_sym = (chunk_df['ch_addr'] == 1) | (chunk_df['ch_skel'] == 1) | (chunk_df['ch_rare'] == 1)
-            chunk_df = chunk_df.assign(is_sym=is_sym).sort_values(['s1_id', 'is_sym', 'emb_score'], ascending=[True, False, False]).drop(columns=['is_sym'])
-            chunk_df = chunk_df.groupby('s1_id').head(CAND_CAP).reset_index(drop=True)
+            if os.path.exists(chunk_out_path):
+                print(f"Chunk {ch_idx + 1}/{num_chunks} already exists ({chunk_out_path}), skipping...", flush=True)
+                continue
+
+            elapsed_so_far = time.time() - start_total_time
+            rss = _rss_mb()
+            print(f"\n>>> Processing Chunk {ch_idx + 1}/{num_chunks}  (elapsed {elapsed_so_far:.0f}s, RSS {rss:.0f} MB)", flush=True)
+            c_s1_ids = all_s1_ids[ch_idx * chunk_size : (ch_idx + 1) * chunk_size]
+            sub_s1_keys = s1_keys_df[s1_keys_df['entity_id'].isin(c_s1_ids)].copy()
             
-        # Add label column if ground truth exists
-        if gt_df is not None:
-            gt_pairs = gt_df[['s1_id', 'match_id']].rename(columns={'match_id': 'cand_id'})
-            gt_pairs['label'] = 1
-            chunk_df = chunk_df.merge(gt_pairs, on=['s1_id', 'cand_id'], how='left')
-            chunk_df['label'] = chunk_df['label'].fillna(0).astype(int)
+            chunk_cands_list = []
             
-        chunk_df.to_parquet(chunk_out_path, index=False)
-        elapsed_ch = time.time() - start_total_time
-        rss_ch = _rss_mb()
-        print(f"Saved chunk {ch_idx + 1}/{num_chunks} ({len(chunk_df)} candidate pairs) to {chunk_out_path}  "
-              f"(total elapsed {elapsed_ch:.0f}s, RSS {rss_ch:.0f} MB)", flush=True)
-        del chunk_df, chunk_cands_list
-        gc.collect()
+            # Sources to block against
+            cand_sources = [
+                ("source2", 0, c2_keys_df, c2_e_keys, c2_m_emb, c2_m_map, c2_m_ids, c2_a_emb, c2_a_map, c2_a_ids),
+                ("source3", 1, c3_keys_df, c3_e_keys, c3_m_emb, c3_m_map, c3_m_ids, c3_a_emb, c3_a_map, c3_a_ids)
+            ]
+            
+            countries = sub_s1_keys['country'].dropna().unique() if BLOCK_BY_COUNTRY else ["ALL"]
+            
+            for src_name, src_code, c_keys_df, c_e_keys, c_m_emb, c_m_map, c_m_ids, c_a_emb, c_a_map, c_a_ids in cand_sources:
+                if len(c_m_ids) == 0: continue
+                
+                for country in countries:
+                    if BLOCK_BY_COUNTRY:
+                        s1_c_df = sub_s1_keys[sub_s1_keys['country'] == country]
+                        c_c_df = c_keys_df[c_keys_df['country'] == country]
+                    else:
+                        s1_c_df = sub_s1_keys
+                        c_c_df = c_keys_df
+                        
+                    s1_c_ids = s1_c_df['entity_id'].values
+                    cand_c_ids = c_c_df['entity_id'].values
+                    
+                    if len(s1_c_ids) == 0 or len(cand_c_ids) == 0:
+                        continue
+                        
+                    # --- Channel A: GPU Embedding Search ---
+                    df_a = search_channel_a_gpu(
+                        s1_c_ids, s1_m_emb, s1_m_map, s1_a_emb, s1_a_map,
+                        cand_c_ids, c_m_emb, c_m_map, c_a_emb, c_a_map,
+                        args.k_channel_a, device
+                    )
+                    
+                    # --- Channel B: Address Hash Join (v2) ---
+                    s1_b_keys = build_channel_b_keys(s1_c_df)
+                    c_b_keys = build_channel_b_keys(c_c_df)
+                    if not s1_b_keys.empty and not c_b_keys.empty:
+                        valid_b = get_valid_keys(c_b_keys, 'b_key', MAX_BLOCK_SIZE)
+                        s1_b_valid = s1_b_keys[s1_b_keys['b_key'].isin(valid_b)]
+                        c_b_valid = c_b_keys[c_b_keys['b_key'].isin(valid_b)]
+                        df_b = s1_b_valid.merge(c_b_valid, on='b_key').rename(
+                            columns={'entity_id_x': 's1_id', 'entity_id_y': 'cand_id'}
+                        )[['s1_id', 'cand_id']].drop_duplicates()
+                        df_b = df_b.groupby('s1_id').head(MAX_ADDR_CANDS).reset_index(drop=True)
+                        df_b['ch_addr'] = 1
+                    else:
+                        df_b = pd.DataFrame(columns=['s1_id', 'cand_id', 'ch_addr'])
+                    
+                    # --- Channel C: Name Skeleton Hash Join ---
+                    s1_c_keys = build_channel_c_keys(s1_c_df)
+                    c_c_keys = build_channel_c_keys(c_c_df)
+                    if not s1_c_keys.empty and not c_c_keys.empty:
+                        valid_c = get_valid_keys(c_c_keys, 'c_key', MAX_BLOCK_SIZE)
+                        s1_c_valid = s1_c_keys[s1_c_keys['c_key'].isin(valid_c)]
+                        c_c_valid = c_c_keys[c_c_keys['c_key'].isin(valid_c)]
+                        df_c = s1_c_valid.merge(c_c_valid, on='c_key').rename(
+                            columns={'entity_id_x': 's1_id', 'entity_id_y': 'cand_id'}
+                        )[['s1_id', 'cand_id']].drop_duplicates()
+                        df_c = df_c.groupby('s1_id').head(MAX_SKEL_CANDS).reset_index(drop=True)
+                        df_c['ch_skel'] = 1
+                    else:
+                        df_c = pd.DataFrame(columns=['s1_id', 'cand_id', 'ch_skel'])
+
+                    # --- Channel E: Rare Address Tokens ---
+                    s1_e_keys = build_channel_e_keys(s1_c_df, df_tokens)
+                    c_e_keys_c = c_e_keys[c_e_keys['entity_id'].isin(cand_c_ids)]
+                    if not s1_e_keys.empty and not c_e_keys_c.empty:
+                        valid_e = get_valid_keys(c_e_keys_c, 'e_key', MAX_BLOCK_SIZE)
+                        s1_e_valid = s1_e_keys[s1_e_keys['e_key'].isin(valid_e)]
+                        c_e_valid = c_e_keys_c[c_e_keys_c['e_key'].isin(valid_e)]
+                        df_e = s1_e_valid.merge(c_e_valid, on='e_key').rename(
+                            columns={'entity_id_x': 's1_id', 'entity_id_y': 'cand_id'}
+                        )[['s1_id', 'cand_id']].drop_duplicates()
+                        df_e = df_e.groupby('s1_id').head(MAX_RARE_CANDS).reset_index(drop=True)
+                        df_e['ch_rare'] = 1
+                    else:
+                        df_e = pd.DataFrame(columns=['s1_id', 'cand_id', 'ch_rare'])
+
+                    # --- Union Channels A, B, C, E ---
+                    merged_cands = pd.concat([df_a, df_b, df_c, df_e], ignore_index=True)
+                    if merged_cands.empty:
+                        continue
+                        
+                    agg_dict = {
+                        'ch_emb': 'max', 'ch_addr': 'max', 'ch_skel': 'max', 'ch_rare': 'max',
+                        'emb_score': 'max', 'emb_rank': 'min'
+                    }
+                    merged_cands = merged_cands.groupby(['s1_id', 'cand_id']).agg(agg_dict).reset_index()
+                    merged_cands[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare']] = merged_cands[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare']].fillna(0).astype(int)
+                    
+                    # Compute missing emb_score for non-Channel A candidates
+                    missing_mask = merged_cands['emb_score'].isna()
+                    if missing_mask.any():
+                        df_miss = merged_cands[missing_mask]
+                        missing_scores = compute_missing_scores_vectorized(
+                            df_miss, s1_m_emb, s1_m_map, s1_a_emb, s1_a_map,
+                            c_m_emb, c_m_map, c_a_emb, c_a_map
+                        )
+                        merged_cands.loc[missing_mask, 'emb_score'] = missing_scores
+                        merged_cands.loc[missing_mask, 'emb_rank'] = 999
+                        
+                    merged_cands['cand_source'] = src_code
+                    chunk_cands_list.append(merged_cands)
+                    
+            # Append Channel D reverse candidates for S1 in this chunk
+            df_d_chunk = all_rev_cands[all_rev_cands['s1_id'].isin(c_s1_ids)].copy()
+            if not df_d_chunk.empty:
+                chunk_cands_list.append(df_d_chunk)
+                
+            if not chunk_cands_list:
+                chunk_df = pd.DataFrame(columns=['s1_id', 'cand_id', 'cand_source', 'emb_score', 'emb_rank', 'ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev'])
+            else:
+                chunk_df = pd.concat(chunk_cands_list, ignore_index=True)
+                agg_chunk = {
+                    'ch_emb': 'max', 'ch_addr': 'max', 'ch_skel': 'max', 'ch_rare': 'max', 'ch_rev': 'max',
+                    'emb_score': 'max', 'emb_rank': 'min', 'cand_source': 'first'
+                }
+                chunk_df = chunk_df.groupby(['s1_id', 'cand_id']).agg(agg_chunk).reset_index()
+                chunk_df[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev']] = chunk_df[['ch_emb', 'ch_addr', 'ch_skel', 'ch_rare', 'ch_rev']].fillna(0).astype(int)
+                
+                # Cap candidates per S1 to CAND_CAP, prioritizing symbolic address blocks
+                is_sym = (chunk_df['ch_addr'] == 1) | (chunk_df['ch_skel'] == 1) | (chunk_df['ch_rare'] == 1)
+                chunk_df = chunk_df.assign(is_sym=is_sym).sort_values(['s1_id', 'is_sym', 'emb_score'], ascending=[True, False, False]).drop(columns=['is_sym'])
+                chunk_df = chunk_df.groupby('s1_id').head(CAND_CAP).reset_index(drop=True)
+                
+            # Add label column if ground truth exists
+            if gt_df is not None:
+                gt_pairs = gt_df[['s1_id', 'match_id']].rename(columns={'match_id': 'cand_id'})
+                gt_pairs['label'] = 1
+                chunk_df = chunk_df.merge(gt_pairs, on=['s1_id', 'cand_id'], how='left')
+                chunk_df['label'] = chunk_df['label'].fillna(0).astype(int)
+                
+            chunk_df.to_parquet(chunk_out_path, index=False)
+            elapsed_ch = time.time() - start_total_time
+            rss_ch = _rss_mb()
+            print(f"Saved chunk {ch_idx + 1}/{num_chunks} ({len(chunk_df)} candidate pairs) to {chunk_out_path}  "
+                  f"(total elapsed {elapsed_ch:.0f}s, RSS {rss_ch:.0f} MB)", flush=True)
+            del chunk_df, chunk_cands_list
+            gc.collect()
 
     # --------------------------------------------------------------------------
     # Post-processing: NO combined 9-crore parquet.
