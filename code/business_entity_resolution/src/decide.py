@@ -116,20 +116,85 @@ def apply_thresholds(
     return pred_dict
 
 
+import json
+import os
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+import numpy as np
+import pandas as pd
+
+import config
+
+
+def load_decision_thresholds(cache_dir: Optional[str] = None) -> Tuple[float, float, float, bool, str]:
+    """
+    Loads decision thresholds:
+    1. Checks <cache_dir>/thresholds.json or cache/thresholds.json.
+    2. Falls back to config.py if thresholds.json is not found.
+    Returns: (t_top1, t_extra, margin, use_exclusivity, source_description)
+    """
+    candidate_paths = []
+    if cache_dir:
+        candidate_paths.append(os.path.join(cache_dir, "thresholds.json"))
+    if hasattr(config, "CACHE_DIR"):
+        candidate_paths.append(os.path.join(config.CACHE_DIR, "thresholds.json"))
+    candidate_paths.append("cache/thresholds.json")
+
+    for path in candidate_paths:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                t_top1 = float(data["t_top1"])
+                t_extra = float(data["t_extra"])
+                margin = float(data.get("margin", 0.05))
+                use_excl = bool(data.get("use_exclusivity", True))
+                return t_top1, t_extra, margin, use_excl, path
+            except Exception as e:
+                print(f"Warning: Failed to load {path}: {e}")
+
+    # Fallback to config.py
+    t_top1 = getattr(config, "T_TOP1", 0.48)
+    t_top1 = 0.48 if t_top1 is None else float(t_top1)
+
+    t_extra = getattr(config, "T_EXTRA", 0.68)
+    t_extra = 0.68 if t_extra is None else float(t_extra)
+
+    margin = getattr(config, "EXCL_MARGIN", 0.05)
+    margin = 0.05 if margin is None else float(margin)
+
+    use_excl = getattr(config, "USE_EXCLUSIVITY", True)
+    use_excl = True if use_excl is None else bool(use_excl)
+
+    return t_top1, t_extra, margin, use_excl, "config.py"
+
+
 def decide(
     probs_df: pd.DataFrame,
-    t_top1: float,
-    t_extra: float,
-    margin: float = 0.0,
-    use_exclusivity: bool = True,
-    all_s1_ids: Optional[Iterable[str]] = None
-) -> Dict[str, List[str]]:
+    t_top1: Optional[float] = None,
+    t_extra: Optional[float] = None,
+    margin: Optional[float] = None,
+    use_exclusivity: Optional[bool] = None,
+    all_s1_ids: Optional[Iterable[Any]] = None,
+    cache_dir: Optional[str] = None
+) -> Dict[Any, List[Any]]:
     """
     Main decision function executing full Step 8 decision layer in order:
-    1. Exclusivity resolution across cand_id (with tie-breaks and margin check).
-    2. Per-S1 thresholding (top-1 gate and extra threshold).
+    1. Loads thresholds from cache/thresholds.json (falling back to config.py) if not passed.
+    2. Exclusivity resolution across cand_id (with tie-breaks and margin check).
+    3. Per-S1 thresholding (top-1 gate and extra threshold).
     Returns: dict mapping s1_id -> list of predicted cand_ids.
     """
+    if t_top1 is None or t_extra is None or margin is None or use_exclusivity is None:
+        def_t1, def_te, def_m, def_ue, _ = load_decision_thresholds(cache_dir)
+        if t_top1 is None:
+            t_top1 = def_t1
+        if t_extra is None:
+            t_extra = def_te
+        if margin is None:
+            margin = def_m
+        if use_exclusivity is None:
+            use_exclusivity = def_ue
+
     # Determine complete set of expected S1 IDs from input before exclusivity
     if all_s1_ids is None and len(probs_df) > 0:
         if "is_competitor" in probs_df.columns:

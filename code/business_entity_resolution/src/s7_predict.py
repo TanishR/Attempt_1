@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 import config
-from decide import decide
+from decide import decide, load_decision_thresholds
 from s4_features import _id_to_int
 
 try:
@@ -187,6 +187,10 @@ def main():
     print("=" * 75)
     print(f"=== Step 9: Test Inference (Split: {args.split}, Version: {args.version}) ===")
     print(f"Cache Directory: {cache_dir}")
+    # Load thresholds from cache/thresholds.json (fallback to config.py)
+    t_top1, t_extra, margin, use_excl, thresh_source = load_decision_thresholds(cache_dir)
+    print(f"Decision Thresholds Source: {thresh_source}")
+    print(f"Decision Parameters: USE_EXCLUSIVITY={use_excl}, EXCL_MARGIN={margin:.2f}, T_TOP1={t_top1:.2f}, T_EXTRA={t_extra:.2f}")
     print("=" * 75)
 
     # 1. Load trained LightGBM booster
@@ -229,12 +233,7 @@ def main():
         filter_s1_ids=filter_s1_ids
     )
 
-    # 5. Apply global decision layer with optimal config values
-    t_top1 = config.T_TOP1 if config.T_TOP1 is not None else 0.48
-    t_extra = config.T_EXTRA if config.T_EXTRA is not None else 0.68
-    margin = config.EXCL_MARGIN if config.EXCL_MARGIN is not None else 0.05
-    use_excl = config.USE_EXCLUSIVITY if config.USE_EXCLUSIVITY is not None else True
-
+    # 5. Apply global decision layer with loaded threshold values
     print("\n--- Applying Decision Layer (decide.py) ---")
     print(f"Decision Parameters: USE_EXCLUSIVITY={use_excl}, EXCL_MARGIN={margin:.2f}, T_TOP1={t_top1:.2f}, T_EXTRA={t_extra:.2f}")
 

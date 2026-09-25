@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import pandas as pd
 
 import config
+from decide import load_decision_thresholds
 
 try:
     import psutil
@@ -426,8 +427,7 @@ def main():
     print(f"\nCopied submission files to: {sub_dir}/")
 
     # 9. Append to experiments.md
-    t_top1 = config.T_TOP1 if config.T_TOP1 is not None else 0.48
-    t_extra = config.T_EXTRA if config.T_EXTRA is not None else 0.68
+    t_top1, t_extra, _, _, _ = load_decision_thresholds(cache_dir)
     append_experiments_log(
         version=args.version,
         val_macro_f05=0.9802,

@@ -6,6 +6,7 @@ and logs results to experiments.md.
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -204,27 +205,23 @@ def run_grid_search(
     return all_results
 
 
-def update_config_file(best_top1: float, best_extra: float, best_margin: float, best_excl: bool):
+def save_tuned_thresholds(cache_dir: str, best_top1: float, best_extra: float, best_margin: float, best_excl: bool):
     """
-    Updates config.py with the best tuned decision parameters.
-    Returns: None.
+    Saves the best tuned decision parameters to cache/thresholds.json.
+    Avoids mutating config.py to prevent git conflicts on EC2.
     """
-    cfg_path = os.path.join(os.path.dirname(__file__), "config.py")
-    if not os.path.exists(cfg_path):
-        print(f"Warning: config.py not found at {cfg_path}")
-        return
-
-    with open(cfg_path, "r") as f:
-        content = f.read()
-
-    content = re.sub(r"T_TOP1\s*=\s*.*", f"T_TOP1 = {best_top1:.2f}", content)
-    content = re.sub(r"T_EXTRA\s*=\s*.*", f"T_EXTRA = {best_extra:.2f}", content)
-    content = re.sub(r"EXCL_MARGIN\s*=\s*.*", f"EXCL_MARGIN = {best_margin:.2f}", content)
-    content = re.sub(r"USE_EXCLUSIVITY\s*=\s*.*", f"USE_EXCLUSIVITY = {best_excl}", content)
-
-    with open(cfg_path, "w") as f:
-        f.write(content)
-    print(f"Updated config.py: T_TOP1={best_top1:.2f}, T_EXTRA={best_extra:.2f}, EXCL_MARGIN={best_margin:.2f}, USE_EXCLUSIVITY={best_excl}")
+    thresh_data = {
+        "t_top1": round(float(best_top1), 4),
+        "t_extra": round(float(best_extra), 4),
+        "margin": round(float(best_margin), 4),
+        "use_exclusivity": bool(best_excl),
+        "updated_at": datetime.now().isoformat()
+    }
+    os.makedirs(cache_dir, exist_ok=True)
+    out_path = os.path.join(cache_dir, "thresholds.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(thresh_data, f, indent=2)
+    print(f"Saved tuned thresholds to {out_path}: T_TOP1={best_top1:.2f}, T_EXTRA={best_extra:.2f}, EXCL_MARGIN={best_margin:.2f}, USE_EXCLUSIVITY={best_excl}")
 
 
 def generate_slice_report(
@@ -520,8 +517,8 @@ def main():
     verified_score = macro_f05(best_preds, gold_map)
     assert abs(verified_score - best_score) < 1e-4, f"Mismatch: {verified_score} vs {best_score}"
 
-    # 6. Update config.py with winning parameters
-    update_config_file(best_top1=best_t1, best_extra=best_te, best_margin=best_m, best_excl=best_ue)
+    # 6. Save winning parameters to cache/thresholds.json
+    save_tuned_thresholds(cache_dir=cache_dir, best_top1=best_t1, best_extra=best_te, best_margin=best_m, best_excl=best_ue)
 
     # 7. Generate Slice Report
     norm_s1 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source1.parquet"))
