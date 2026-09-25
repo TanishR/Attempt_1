@@ -31,3 +31,19 @@ Based on comprehensive Exploratory Data Analysis over the full training set (2.2
 3. **Cross-Script Ground Truth Pairs:** In the dataset, ground-truth matches occur across scripts (e.g., Devanagari in S2/S3 matched to Latin in S1, or native script in both). Generating both raw script and transliterated embeddings allows multi-vector max-pooling in Channel A search:
    $$\text{score}(S_1, C_2) = \max\Big(Q_{\text{main}} \cdot X_{\text{main}}^T, \, Q_{\text{main}} \cdot X_{\text{alt}}^T, \, Q_{\text{alt}} \cdot X_{\text{main}}^T, \, Q_{\text{alt}} \cdot X_{\text{alt}}^T\Big)$$
    This guarantees maximal recall regardless of whether the pair is native-to-native, native-to-Latin, or Latin-to-Latin.
+
+---
+
+## 3. Train/Test Distribution Shift Fix
+
+### Problem
+Train blocking initially used only the 4 lakh sampled S1 (3 lakh train + 1 lakh val from `split.parquet`), while test uses all 17.3 lakh S1 against a similar-size S2/S3 pool. This meant `reverse_rank`, Channel D reverse search, and exclusivity saw far less competition during training than at test time.
+
+### Fix (applied to Steps 4-6)
+1. **s2_embed.py `--all-s1`**: Embed ALL train S1 (all ~22 lakh), not just the sampled 4 lakh.
+2. **s3_block.py**: Run blocking for ALL train S1, so Channel D and reverse_rank see the full competition. Candidate files cover all S1.
+3. **s4_features.py**: Compute `reverse_rank` globally over the FULL train candidate table (all S1), but compute and save features only for S1 in `split.parquet` (the 4 lakh train+val sample). This ensures `reverse_rank` reflects realistic competition while keeping feature computation tractable.
+4. **Step 8 (s6_tune.py)**: Exclusivity on val must run against ALL train S1 probabilities — not just val S1. When `s6_tune.py` applies the exclusivity filter, it must predict probabilities for all ~22 lakh train S1 candidates (or at least load the full train candidate table with probabilities) so that a `cand_id` shared between a val S1 and a non-sampled S1 is correctly resolved.
+
+### Note on `n_cands`
+`n_cands` is constant (always `CAND_CAP=40`) since capping is applied after blocking. It is kept as a feature because it does no harm and may help if capping changes in future versions.
