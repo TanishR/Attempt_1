@@ -57,30 +57,65 @@ def load_embedding_arrays(cache_dir, split, source):
 
 def load_blocking_keys(cache_dir, split, source):
     """
-    Loads normalized table and constructs composite blocking keys for Channel B and Channel C.
-    Returns: pandas.DataFrame with entity_id, country, key_addr1, key_addr2, and key_skel.
+    Loads normalized table columns needed for symbolic blocking (Channels B, C, and E).
+    Returns: pandas.DataFrame with entity_id, country, house_cands, num_tokens, zip_pin, name_skel, addr_norm.
     """
     path = os.path.join(cache_dir, f"norm_{split}_{source}.parquet")
     if not os.path.exists(path):
         return pd.DataFrame()
-    cols = ["entity_id", "country", "house_no", "street_token", "zip_pin", "name_skel"]
-    df = pd.read_parquet(path, columns=cols)
+    cols = ["entity_id", "country", "house_cands", "num_tokens", "zip_pin", "name_skel", "addr_norm"]
+    # Fallback if some columns missing
+    available_cols = pd.read_parquet(path).columns
+    load_cols = [c for c in cols if c in available_cols]
+    df = pd.read_parquet(path, columns=load_cols)
+    return df
+
+def build_channel_b_keys(df):
+    """
+    Channel B v2: builds keys (country, number, next_alpha) for up to 3 house candidates
+    plus (country, zip_pin, number) for each number token.
+    Returns: pandas.DataFrame with columns ['entity_id', 'b_key'].
+    """
+    keys_list = []
     
-    df["skel_sorted"] = df["name_skel"].fillna("").astype(str).apply(lambda x: " ".join(sorted(x.split())))
-    
-    # Channel B keys
-    has_h = df["house_no"].astype(bool)
-    has_st = df["street_token"].astype(bool)
-    has_z = df["zip_pin"].astype(bool)
-    
-    df["key_addr1"] = np.where(has_h & has_st, df["country"] + "_" + df["house_no"] + "_" + df["street_token"], None)
-    df["key_addr2"] = np.where(has_h & has_z, df["country"] + "_" + df["zip_pin"] + "_" + df["house_no"], None)
-    
-    # Channel C key
-    has_sk = df["skel_sorted"].astype(bool)
-    df["key_skel"] = np.where(has_sk, df["country"] + "_" + df["skel_sorted"], None)
-    
-    return df[["entity_id", "country", "key_addr1", "key_addr2", "key_skel"]]
+    # 1. House candidates: (country, number, next_alpha)
+    if 'house_cands' in df.columns:
+        df_h = df[['entity_id', 'country', 'house_cands']].dropna()
+        df_h = df_h[df_h['house_cands'] != '']
+        if not df_h.empty:
+            df_h = df_h.assign(b_key=df_h['house_cands'].str.split(';')).explode('b_key')
+            df_h = df_h[df_h['b_key'].str.len() > 0]
+            df_h['b_key'] = "H_" + df_h['country'] + "_" + df_h['b_key']
+            keys_list.append(df_h[['entity_id', 'b_key']])
+            
+    # 2. Zip + number: (country, zip_pin, number)
+    if 'zip_pin' in df.columns and 'num_tokens' in df.columns:
+        df_z = df[['entity_id', 'country', 'zip_pin', 'num_tokens']].dropna()
+        df_z = df_z[(df_z['zip_pin'] != '') & (df_z['num_tokens'] != '')]
+        if not df_z.empty:
+            df_z = df_z.assign(b_key=df_z['num_tokens'].str.split()).explode('b_key')
+            df_z = df_z[df_z['b_key'].str.len() > 0]
+            df_z['b_key'] = "Z_" + df_z['country'] + "_" + df_z['zip_pin'] + "_" + df_z['b_key']
+            keys_list.append(df_z[['entity_id', 'b_key']])
+            
+    if keys_list:
+        return pd.concat(keys_list, ignore_index=True).drop_duplicates()
+    return pd.DataFrame(columns=['entity_id', 'b_key'])
+
+def build_channel_c_keys(df):
+    """
+    Channel C: builds keys (country, sorted name_skel) for typo/cross-script near-exact matches.
+    Returns: pandas.DataFrame with columns ['entity_id', 'c_key'].
+    """
+    if 'name_skel' not in df.columns:
+        return pd.DataFrame(columns=['entity_id', 'c_key'])
+    df_sk = df[['entity_id', 'country', 'name_skel']].dropna()
+    df_sk = df_sk[df_sk['name_skel'] != '']
+    if df_sk.empty:
+        return pd.DataFrame(columns=['entity_id', 'c_key'])
+    sk_sorted = df_sk['name_skel'].astype(str).apply(lambda x: " ".join(sorted(x.split())))
+    df_sk = df_sk.assign(c_key="SK_" + df_sk['country'] + "_" + sk_sorted)
+    return df_sk[['entity_id', 'c_key']].drop_duplicates()
 
 def get_valid_keys(df, col, max_block_size):
     """
@@ -88,7 +123,8 @@ def get_valid_keys(df, col, max_block_size):
     Returns: pandas.Index containing valid keys.
     """
     counts = df[col].dropna().value_counts()
-    return counts[counts <= max_block_size].index
+    return set(counts[counts <= max_block_size].index)
+
 
 def search_channel_a_gpu(
     s1_ids, s1_main_emb, s1_main_map, s1_alt_emb, s1_alt_map,
@@ -438,33 +474,36 @@ def main():
                     K_PER_SOURCE, device
                 )
                 
-                # --- Channel B: Address Hash Join ---
-                valid_a1 = get_valid_keys(c_c_df, 'key_addr1', MAX_BLOCK_SIZE)
-                df_b1 = s1_c_df[['entity_id', 'key_addr1']].dropna().merge(
-                    c_c_df[c_c_df['key_addr1'].isin(valid_a1)][['entity_id', 'key_addr1']],
-                    on='key_addr1'
-                ).rename(columns={'entity_id_x': 's1_id', 'entity_id_y': 'cand_id'})[['s1_id', 'cand_id']]
-                
-                valid_a2 = get_valid_keys(c_c_df, 'key_addr2', MAX_BLOCK_SIZE)
-                df_b2 = s1_c_df[['entity_id', 'key_addr2']].dropna().merge(
-                    c_c_df[c_c_df['key_addr2'].isin(valid_a2)][['entity_id', 'key_addr2']],
-                    on='key_addr2'
-                ).rename(columns={'entity_id_x': 's1_id', 'entity_id_y': 'cand_id'})[['s1_id', 'cand_id']]
-                
-                df_b = pd.concat([df_b1, df_b2], ignore_index=True).drop_duplicates()
-                df_b = df_b.groupby('s1_id').head(MAX_ADDR_CANDS).reset_index(drop=True)
-                df_b['ch_addr'] = 1
+                # --- Channel B: Address Hash Join (v2) ---
+                s1_b_keys = build_channel_b_keys(s1_c_df)
+                c_b_keys = build_channel_b_keys(c_c_df)
+                if not s1_b_keys.empty and not c_b_keys.empty:
+                    valid_b = get_valid_keys(c_b_keys, 'b_key', MAX_BLOCK_SIZE)
+                    s1_b_valid = s1_b_keys[s1_b_keys['b_key'].isin(valid_b)]
+                    c_b_valid = c_b_keys[c_b_keys['b_key'].isin(valid_b)]
+                    df_b = s1_b_valid.merge(c_b_valid, on='b_key').rename(
+                        columns={'entity_id_x': 's1_id', 'entity_id_y': 'cand_id'}
+                    )[['s1_id', 'cand_id']].drop_duplicates()
+                    df_b = df_b.groupby('s1_id').head(MAX_ADDR_CANDS).reset_index(drop=True)
+                    df_b['ch_addr'] = 1
+                else:
+                    df_b = pd.DataFrame(columns=['s1_id', 'cand_id', 'ch_addr'])
                 
                 # --- Channel C: Name Skeleton Hash Join ---
-                valid_sk = get_valid_keys(c_c_df, 'key_skel', MAX_BLOCK_SIZE)
-                df_c = s1_c_df[['entity_id', 'key_skel']].dropna().merge(
-                    c_c_df[c_c_df['key_skel'].isin(valid_sk)][['entity_id', 'key_skel']],
-                    on='key_skel'
-                ).rename(columns={'entity_id_x': 's1_id', 'entity_id_y': 'cand_id'})[['s1_id', 'cand_id']]
-                
-                df_c = df_c.drop_duplicates()
-                df_c = df_c.groupby('s1_id').head(MAX_SKEL_CANDS).reset_index(drop=True)
-                df_c['ch_skel'] = 1
+                s1_c_keys = build_channel_c_keys(s1_c_df)
+                c_c_keys = build_channel_c_keys(c_c_df)
+                if not s1_c_keys.empty and not c_c_keys.empty:
+                    valid_c = get_valid_keys(c_c_keys, 'c_key', MAX_BLOCK_SIZE)
+                    s1_c_valid = s1_c_keys[s1_c_keys['c_key'].isin(valid_c)]
+                    c_c_valid = c_c_keys[c_c_keys['c_key'].isin(valid_c)]
+                    df_c = s1_c_valid.merge(c_c_valid, on='c_key').rename(
+                        columns={'entity_id_x': 's1_id', 'entity_id_y': 'cand_id'}
+                    )[['s1_id', 'cand_id']].drop_duplicates()
+                    df_c = df_c.groupby('s1_id').head(MAX_SKEL_CANDS).reset_index(drop=True)
+                    df_c['ch_skel'] = 1
+                else:
+                    df_c = pd.DataFrame(columns=['s1_id', 'cand_id', 'ch_skel'])
+
                 
                 # --- Union Channels ---
                 merged_cands = pd.concat([df_a, df_b, df_c], ignore_index=True)
