@@ -2,9 +2,10 @@ import os
 import sys
 import time
 import argparse
-from collections import Counter
+from collections import defaultdict, Counter
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from rapidfuzz import process, fuzz
 
 import config
@@ -77,6 +78,21 @@ def _id_to_int(series: pd.Series, validate: bool = True) -> pd.Series:
     return encoded
 
 
+def _int_to_id(ints):
+    """
+    Converts int64 encoded IDs back to 'S1-12345', 'S2-12345', 'S3-12345' style strings.
+    """
+    if isinstance(ints, (pd.Series, np.ndarray)):
+        arr = np.asarray(ints, dtype=np.int64)
+    else:
+        arr = np.array(list(ints), dtype=np.int64)
+    if len(arr) == 0:
+        return set() if isinstance(ints, set) else []
+    src = arr // 1_000_000_000_000
+    num = arr % 1_000_000_000_000
+    res = [f"S{s}-{n}" for s, n in zip(src, num)]
+    return set(res) if isinstance(ints, set) else res
+
 
 def parse_args():
     """
@@ -88,29 +104,80 @@ def parse_args():
     parser.add_argument("--laptop-test", action="store_true", help="Use small laptop test pool in cache/laptop_test/")
     parser.add_argument("--cache-dir", type=str, default=None, help="Custom cache directory path")
     parser.add_argument("--force", action="store_true", help="Overwrite existing feature parquet files")
+    parser.add_argument("--count-only", action="store_true", help="Print number of feature rows and unique IDs, then exit")
+    parser.add_argument("--max-chunks", type=int, default=None, help="Process only the first N feature chunks")
     return parser.parse_args()
 
-def compute_address_token_df(s1_df, s2_df, s3_df):
+
+def get_address_token_df(cache_dir: str, split: str):
     """
-    Computes per-country document frequencies of address tokens (len >= 5) across S1+S2+S3.
-    Returns: dict mapping country string to Counter of {token: doc_count}.
+    Computes or loads per-country document frequencies of address tokens (len >= 5) across S1+S2+S3.
+    Uses a memory-light streaming batch reader and caches results to cache/addr_df_{split}.parquet.
+    Returns: dict mapping country string to dict of {token: doc_count}.
     """
+    addr_df_path = os.path.join(cache_dir, f"addr_df_{split}.parquet")
+    if not os.path.exists(addr_df_path) and split == "test":
+        train_path = os.path.join(cache_dir, "addr_df_train.parquet")
+        if os.path.exists(train_path):
+            addr_df_path = train_path
+
+    if os.path.exists(addr_df_path):
+        print(f"Loading cached address token document frequencies from {addr_df_path}...", flush=True)
+        t0 = time.time()
+        df_saved = pd.read_parquet(addr_df_path)
+        df_tokens = {}
+        for c, grp in df_saved.groupby('country'):
+            df_tokens[c] = dict(zip(grp['token'], grp['doc_freq']))
+        print(f"  Loaded {len(df_saved):,} address tokens across {len(df_tokens)} countries "
+              f"in {time.time() - t0:.2f}s (RSS {_rss_mb():.0f} MB)", flush=True)
+        return df_tokens
+
+    print(f"Computing address token document frequencies across S1+S2+S3 (memory-light streaming)...", flush=True)
+    t0 = time.time()
+    counts = defaultdict(Counter)
+
+    for src in ["source1", "source2", "source3"]:
+        paths_to_try = [
+            os.path.join(cache_dir, f"norm_{split}_{src}.parquet"),
+            os.path.join(cache_dir, f"norm_train_{src}.parquet"),
+            os.path.join(cache_dir, f"norm_{src}.parquet"),
+        ]
+        target_path = None
+        for p in paths_to_try:
+            if os.path.exists(p):
+                target_path = p
+                break
+        if not target_path:
+            continue
+
+        pf = pq.ParquetFile(target_path)
+        for batch in pf.iter_batches(batch_size=500_000, columns=['country', 'addr_norm']):
+            b_df = batch.to_pandas()
+            c_arr = b_df['country'].values
+            a_arr = b_df['addr_norm'].values
+            for c, a in zip(c_arr, a_arr):
+                if a and isinstance(a, str):
+                    toks = set(t for t in a.split() if len(t) >= 5)
+                    ctr = counts[c]
+                    for t in toks:
+                        ctr[t] += 1
+
+    records = []
+    for c, ctr in counts.items():
+        for tok, cnt in ctr.items():
+            records.append((c, tok, cnt))
+    df_out = pd.DataFrame(records, columns=['country', 'token', 'doc_freq'])
+    df_out['doc_freq'] = df_out['doc_freq'].astype(np.int32)
+    save_path = os.path.join(cache_dir, f"addr_df_{split}.parquet")
+    df_out.to_parquet(save_path, index=False)
+    print(f"  Saved {len(df_out):,} address tokens to {save_path} in {time.time() - t0:.2f}s "
+          f"(RSS {_rss_mb():.0f} MB)", flush=True)
+
     df_tokens = {}
-    all_countries = set(s1_df['country']).union(set(s2_df['country'])).union(set(s3_df['country']))
-    for c in all_countries:
-        c_counter = Counter()
-        for df_src in [s1_df, s2_df, s3_df]:
-            if df_src.empty or 'country' not in df_src.columns or 'addr_norm' not in df_src.columns:
-                continue
-            sub = df_src[df_src['country'] == c]
-            for addr in sub['addr_norm'].dropna():
-                if not isinstance(addr, str) or not addr.strip():
-                    continue
-                toks = set(t for t in addr.split() if len(t) >= 5)
-                for t in toks:
-                    c_counter[t] += 1
-        df_tokens[c] = c_counter
+    for c, grp in df_out.groupby('country'):
+        df_tokens[c] = dict(zip(grp['token'], grp['doc_freq']))
     return df_tokens
+
 
 def extract_rare3_set(addr, country, df_tokens):
     """
@@ -126,9 +193,18 @@ def extract_rare3_set(addr, country, df_tokens):
     toks.sort(key=lambda t: (ctr.get(t, 0), t))
     return frozenset(toks[:3])
 
-def load_norm_table(cache_dir, split, source):
+
+NEEDED_NORM_COLS = [
+    'entity_id', 'country', 'name_full', 'core_name', 'name_skel',
+    'addr_norm', 'legal', 'name_a', 'name_b', 'name_aka_a', 'name_aka_b',
+    'house_no', 'zip_pin', 'state_code', 'num_tokens', 'house_cands'
+]
+
+
+def load_norm_table(cache_dir, split, source, needed_ids=None, columns=None):
     """
-    Loads normalized table for a source with fallback paths across train and test splits.
+    Loads normalized table for a source with fallback paths across train and test splits,
+    restricted to only the needed entity IDs and columns.
     Returns: pandas.DataFrame indexed by entity_id.
     """
     paths_to_try = [
@@ -138,13 +214,21 @@ def load_norm_table(cache_dir, split, source):
     ]
     for p in paths_to_try:
         if os.path.exists(p):
-            df = pd.read_parquet(p)
+            cols_to_read = columns
+            if cols_to_read is not None:
+                if "entity_id" not in cols_to_read:
+                    cols_to_read = ["entity_id"] + list(cols_to_read)
+            df = pd.read_parquet(p, columns=cols_to_read)
+            if needed_ids is not None:
+                df = df[df["entity_id"].isin(needed_ids)]
             return df.set_index("entity_id")
     raise FileNotFoundError(f"Could not find normalized table for {source} in {cache_dir}")
 
-def load_candidate_embeddings(cache_dir, split):
+
+def load_candidate_embeddings(cache_dir, split, needed_cand_ids=None):
     """
     Loads candidate main embeddings for Source 2 and Source 3 into a stacked float32 matrix.
+    If needed_cand_ids is provided, restricts to only those candidate IDs.
     Returns: tuple of (all_cand_emb, id_to_row_map).
     """
     s2_m_p = os.path.join(cache_dir, f"emb_{split}_source2.npy")
@@ -163,8 +247,17 @@ def load_candidate_embeddings(cache_dir, split):
 
     s2_emb = np.load(s2_m_p)
     s2_ids = np.load(s2_id_p, allow_pickle=True)
+    if needed_cand_ids is not None:
+        s2_mask = pd.Series(s2_ids).isin(needed_cand_ids).values
+        s2_emb = s2_emb[s2_mask]
+        s2_ids = s2_ids[s2_mask]
+
     s3_emb = np.load(s3_m_p)
     s3_ids = np.load(s3_id_p, allow_pickle=True)
+    if needed_cand_ids is not None:
+        s3_mask = pd.Series(s3_ids).isin(needed_cand_ids).values
+        s3_emb = s3_emb[s3_mask]
+        s3_ids = s3_ids[s3_mask]
 
     all_cand_emb = np.vstack([s2_emb, s3_emb]).astype(np.float32)
     id_to_row = {cid: idx for idx, cid in enumerate(s2_ids)}
@@ -173,6 +266,7 @@ def load_candidate_embeddings(cache_dir, split):
         id_to_row[cid] = n_s2 + idx
 
     return all_cand_emb, id_to_row
+
 
 def compute_support_feature(chunk_df, all_cand_emb, id_to_row):
     """
@@ -214,9 +308,11 @@ def compute_support_feature(chunk_df, all_cand_emb, id_to_row):
     support[sorted_orig_idx] = sorted_support
     return support
 
-def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map, global_reverse_rank):
+
+def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map, global_reverse_rank, df_tokens):
     """
     Extracts all 31 features and rule_score for a candidate chunk without row-wise loops.
+    Token sets and lengths are computed locally only for rows in this chunk.
     Returns: pandas.DataFrame containing entity IDs, label, rule_score, and ordered config.FEATURES.
     """
     n_pairs = len(chunk_df)
@@ -249,13 +345,19 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
     empty_sk = (np.array(s1_sk) == '') | (np.array(c_sk) == '')
     skel_ratio[empty_sk] = np.nan
 
-    # 3. name_jaccard over precomputed token frozensets
-    s1_tsets = s1_sub['tok_set'].values
-    c_tsets = cand_sub['tok_set'].values
+    # 3. name_jaccard over per-chunk token sets (cached per unique entity in chunk for speed)
+    chunk_s1_unique = chunk_df['s1_id'].unique()
+    chunk_c_unique = chunk_df['cand_id'].unique()
+
+    s1_tok_map = {eid: frozenset(str(x).split()) for eid, x in zip(chunk_s1_unique, s1_df.loc[chunk_s1_unique, 'name_full'])}
+    c_tok_map = {cid: frozenset(str(x).split()) for cid, x in zip(chunk_c_unique, cands_df.loc[chunk_c_unique, 'name_full'])}
+    s1_tsets = [s1_tok_map[eid] for eid in s1_ids]
+    c_tsets = [c_tok_map[cid] for cid in cand_ids]
     name_jaccard = np.array([
         len(a & b) / len(a | b) if (a or b) else 0.0
         for a, b in zip(s1_tsets, c_tsets)
     ], dtype=np.float32)
+    del s1_tok_map, c_tok_map, s1_tsets, c_tsets
 
     # 4. legal_match: 1 if present and equal, 0 if present and different, -1 if missing
     s1_leg = s1_sub['legal'].values
@@ -279,7 +381,9 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
         aka_max[aka_mask] = np.maximum(s_aka_a, s_aka_b)
 
     # 6. len_diff on core_name
-    len_diff = np.abs(s1_sub['core_len'].values - cand_sub['core_len'].values).astype(np.float32)
+    s1_core_lens = s1_sub['core_name'].str.len().astype(np.int32).values
+    c_core_lens = cand_sub['core_name'].str.len().astype(np.int32).values
+    len_diff = np.abs(s1_core_lens - c_core_lens).astype(np.float32)
 
     # 7. addr_token_set
     addr_token_set = process.cpdist(s1_ad, c_ad, scorer=fuzz.token_set_ratio, workers=-1).astype(np.float32)
@@ -303,27 +407,36 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
     state_match = np.where(st_miss, -1, np.where(s1_st == c_st, 1, 0)).astype(np.float32)
 
     # 9. house_cand_match: 1 if any candidate matches, 0 if both exist but differ, -1 if missing
-    s1_hc = s1_sub['hc_set'].values
-    c_hc = cand_sub['hc_set'].values
+    s1_hc_map = {eid: (frozenset(str(x).split(';')) if str(x).strip() else frozenset()) for eid, x in zip(chunk_s1_unique, s1_df.loc[chunk_s1_unique, 'house_cands'])}
+    c_hc_map = {cid: (frozenset(str(x).split(';')) if str(x).strip() else frozenset()) for cid, x in zip(chunk_c_unique, cands_df.loc[chunk_c_unique, 'house_cands'])}
+    s1_hc = [s1_hc_map[eid] for eid in s1_ids]
+    c_hc = [c_hc_map[cid] for cid in cand_ids]
     house_cand_match = np.array([
         -1 if (not a or not b) else (1 if bool(a & b) else 0)
         for a, b in zip(s1_hc, c_hc)
     ], dtype=np.float32)
+    del s1_hc_map, c_hc_map, s1_hc, c_hc
 
     # 10. num_jaccard: Jaccard on numeric tokens (NaN if either side has no numbers)
-    s1_num = s1_sub['num_set'].values
-    c_num = cand_sub['num_set'].values
+    s1_num_map = {eid: (frozenset(str(x).split()) if str(x).strip() else frozenset()) for eid, x in zip(chunk_s1_unique, s1_df.loc[chunk_s1_unique, 'num_tokens'])}
+    c_num_map = {cid: (frozenset(str(x).split()) if str(x).strip() else frozenset()) for cid, x in zip(chunk_c_unique, cands_df.loc[chunk_c_unique, 'num_tokens'])}
+    s1_num = [s1_num_map[eid] for eid in s1_ids]
+    c_num = [c_num_map[cid] for cid in cand_ids]
     num_jaccard = np.array([
         np.nan if (not a or not b) else (len(a & b) / len(a | b))
         for a, b in zip(s1_num, c_num)
     ], dtype=np.float32)
+    del s1_num_map, c_num_map, s1_num, c_num
 
     # 11. rare_tok_overlap: count of shared tokens among each side's 3 rarest address tokens
-    s1_r3 = s1_sub['rare3_set'].values
-    c_r3 = cand_sub['rare3_set'].values
+    s1_r3_map = {eid: extract_rare3_set(addr, ctry, df_tokens) for eid, addr, ctry in zip(chunk_s1_unique, s1_df.loc[chunk_s1_unique, 'addr_norm'], s1_df.loc[chunk_s1_unique, 'country'])}
+    c_r3_map = {cid: extract_rare3_set(addr, ctry, df_tokens) for cid, addr, ctry in zip(chunk_c_unique, cands_df.loc[chunk_c_unique, 'addr_norm'], cands_df.loc[chunk_c_unique, 'country'])}
+    s1_r3 = [s1_r3_map[eid] for eid in s1_ids]
+    c_r3 = [c_r3_map[cid] for cid in cand_ids]
     rare_tok_overlap = np.array([
         len(a & b) for a, b in zip(s1_r3, c_r3)
     ], dtype=np.float32)
+    del s1_r3_map, c_r3_map, s1_r3, c_r3
 
     # 12. addr_missing_any: 1 if address empty on either side, else 0
     addr_missing_any = ((np.array(s1_ad) == '') | (np.array(c_ad) == '')).astype(np.float32)
@@ -387,13 +500,19 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
 
     return pd.DataFrame(feats_dict)
 
+
 def compute_global_reverse_ranks(cache_dir, split, chunk_files, sampled_s1_ids=None, val_s1_ids=None):
     """
     Computes global reverse rank per cand_id across all candidates of the split.
     Reads only (s1_id, cand_id, emb_score) per chunk with integer IDs to keep peak RAM
     well below 15 GB even for 9-crore-row train candidate tables.
 
-    Returns: (list of numpy arrays containing reverse_rank for each chunk, set of competitor_s1_ids).
+    Also identifies feature rows to keep:
+      - All candidate pairs for sampled S1
+      - For competitor S1 (s1 not in sampled_s1), ONLY candidate pairs where cand_id in val_cand_ids.
+
+    Returns:
+      (chunk_rr_list, chunk_keep_mask_list, chunk_is_comp_list, needed_s1_ids, needed_cand_ids, counts_info)
     """
     print("Computing global reverse_rank across all candidate chunks...", flush=True)
     t0 = time.time()
@@ -404,8 +523,6 @@ def compute_global_reverse_ranks(cache_dir, split, chunk_files, sampled_s1_ids=N
     for ci, cf in enumerate(chunk_files):
         df = pd.read_parquet(cf, columns=['s1_id', 'cand_id', 'emb_score'])
         chunk_lens.append(len(df))
-        # Convert string IDs to int64 (strips 'S1-' etc.) — ~4× smaller than object dtype
-        # Hard assertion checks run on every chunk: regex, range (< 10^12), nunique collision
         df['s1_int'] = _id_to_int(df['s1_id'], validate=True)
         df['cid_int'] = _id_to_int(df['cand_id'], validate=True)
         df = df.drop(columns=['s1_id', 'cand_id'])
@@ -413,7 +530,6 @@ def compute_global_reverse_ranks(cache_dir, split, chunk_files, sampled_s1_ids=N
         rss = _rss_mb()
         print(f"  [reverse_rank] Read chunk {ci + 1}/{len(chunk_files)}: {len(df):,} rows  "
               f"(RSS {rss:.0f} MB)", flush=True)
-
 
     # --- Concatenate int64 frames and rank globally ---
     print(f"  Concatenating {len(int_chunk_dfs)} int64 frames ({sum(chunk_lens):,} rows)...", flush=True)
@@ -430,42 +546,78 @@ def compute_global_reverse_ranks(cache_dir, split, chunk_files, sampled_s1_ids=N
     )
     print(f"  reverse_rank computed in {time.time() - t0:.2f}s  (RSS {_rss_mb():.0f} MB)", flush=True)
 
+    # --- Identify kept rows (sampled vs competitor) ---
+    if sampled_s1_ids is not None:
+        sampled_int_ids = set(_id_to_int(pd.Series(list(sampled_s1_ids))).values)
+        is_sampled = all_int['s1_int'].isin(sampled_int_ids)
+
+        if val_s1_ids is not None and len(val_s1_ids) > 0:
+            val_int_ids = set(_id_to_int(pd.Series(list(val_s1_ids))).values)
+            val_cid_mask = all_int['s1_int'].isin(val_int_ids)
+            val_cid_ints = set(all_int.loc[val_cid_mask, 'cid_int'].values)
+        else:
+            val_cid_ints = set()
+
+        is_comp = (~is_sampled) & (all_int['cid_int'].isin(val_cid_ints))
+        keep_mask = is_sampled | is_comp
+    else:
+        # Test split or keep all
+        keep_mask = pd.Series(True, index=all_int.index)
+        is_comp = pd.Series(False, index=all_int.index)
+        is_sampled = keep_mask
+
+    # Calculate count statistics
+    n_total_cands = len(all_int)
+    n_sampled_rows = int(is_sampled.sum())
+    n_comp_rows = int(is_comp.sum())
+    n_kept_rows = int(keep_mask.sum())
+
+    unique_sampled_s1_ints = set(all_int.loc[is_sampled, 's1_int'].unique())
+    unique_comp_s1_ints = set(all_int.loc[is_comp, 's1_int'].unique())
+    unique_s1_ints = unique_sampled_s1_ints | unique_comp_s1_ints
+
+    kept_cid_ints = all_int.loc[keep_mask, 'cid_int'].values
+    unique_cand_ints = set(np.unique(kept_cid_ints))
+    s2_cid_ints = {cid for cid in unique_cand_ints if 2_000_000_000_000 <= cid < 3_000_000_000_000}
+    s3_cid_ints = {cid for cid in unique_cand_ints if cid >= 3_000_000_000_000}
+
+    counts_info = {
+        'total_candidate_rows': n_total_cands,
+        'sampled_feature_rows': n_sampled_rows,
+        'competitor_feature_rows': n_comp_rows,
+        'total_feature_rows': n_kept_rows,
+        'unique_sampled_s1': len(unique_sampled_s1_ints),
+        'unique_competitor_s1': len(unique_comp_s1_ints),
+        'unique_total_s1': len(unique_s1_ints),
+        'unique_s2_cands': len(s2_cid_ints),
+        'unique_s3_cands': len(s3_cid_ints),
+        'unique_total_cands': len(unique_cand_ints),
+    }
+
+    needed_s1_ids = _int_to_id(unique_s1_ints)
+    needed_cand_ids = _int_to_id(unique_cand_ints)
+
     # --- Slice back per chunk ---
-    all_rr = all_int['reverse_rank'].values
     chunk_rr_list = []
+    chunk_keep_mask_list = []
+    chunk_is_comp_list = []
     offset = 0
+    all_rr = all_int['reverse_rank'].values
+    all_km = keep_mask.values
+    all_ic = is_comp.values
+
     for clen in chunk_lens:
-        chunk_rr_list.append(all_rr[offset: offset + clen].copy())
+        chunk_rr_list.append(all_rr[offset : offset + clen].copy())
+        chunk_keep_mask_list.append(all_km[offset : offset + clen].copy())
+        chunk_is_comp_list.append(all_ic[offset : offset + clen].copy())
         offset += clen
 
-    # --- Identify competitor S1 ids (still using int64 -> original string mapping not needed) ---
-    competitor_s1_ids = set()
-    if val_s1_ids is not None and len(val_s1_ids) > 0:
-        # Map val string IDs to int64
-        val_int_ids = set(_id_to_int(pd.Series(list(val_s1_ids))).values)
-        val_cid_mask = all_int['s1_int'].isin(val_int_ids)
-        val_cid_ints = set(all_int.loc[val_cid_mask, 'cid_int'].values)
-        if val_cid_ints:
-            sharing_s1_ints = set(all_int.loc[all_int['cid_int'].isin(val_cid_ints), 's1_int'].values)
-            # Convert sampled_s1_ids to int64 set for exclusion
-            sampled_int = set(_id_to_int(pd.Series(list(sampled_s1_ids))).values) if sampled_s1_ids else set()
-            comp_int = sharing_s1_ints - sampled_int
-            # Map competitor int64 IDs back to original string IDs via the original chunk files
-            # We need to find the string IDs that map to comp_int
-            comp_s_prefix = {1_000_000_000_000: 'S1', 2_000_000_000_000: 'S2', 3_000_000_000_000: 'S3'}
-            comp_strings = set()
-            for cid_int in comp_int:
-                src_mult = (cid_int // 1_000_000_000_000) * 1_000_000_000_000
-                num_part = cid_int % 1_000_000_000_000
-                pfx = comp_s_prefix.get(src_mult, 'S1')
-                comp_strings.add(f"{pfx}-{num_part}")
-            competitor_s1_ids = comp_strings
-
-    del all_int
+    del all_int, all_rr, all_km, all_ic, kept_cid_ints
     import gc; gc.collect()
-    print(f"Global reverse_rank done in {time.time() - t0:.2f}s. "
-          f"Competitor S1 count: {len(competitor_s1_ids):,}  (RSS {_rss_mb():.0f} MB)", flush=True)
-    return chunk_rr_list, competitor_s1_ids
+
+    print(f"Global reverse_rank & filtering done in {time.time() - t0:.2f}s  "
+          f"(RSS {_rss_mb():.0f} MB)", flush=True)
+    return chunk_rr_list, chunk_keep_mask_list, chunk_is_comp_list, needed_s1_ids, needed_cand_ids, counts_info
 
 
 def print_acceptance_report(feats_df, elapsed_time):
@@ -514,8 +666,7 @@ def print_acceptance_report(feats_df, elapsed_time):
     print(f"\nTiming:")
     print(f"  Processed {n_pairs:,} candidate pairs in {elapsed_time:.2f}s")
     print(f"  Laptop CPU rate: {time_per_1m:.2f}s per 1M candidate pairs")
-    
-    # Train full: ~16M pairs, Test: ~8M to ~70M pairs
+
     est_train_sample = (16_000_000 / 1_000_000) * time_per_1m / 60.0
     est_test_8m = (8_000_000 / 1_000_000) * time_per_1m / 60.0
     est_test_70m = (70_000_000 / 1_000_000) * time_per_1m / 60.0
@@ -523,6 +674,7 @@ def print_acceptance_report(feats_df, elapsed_time):
     print(f"    - Full Train candidate pairs (~16M pairs): ~{est_train_sample:.1f} minutes")
     print(f"    - Test candidate pairs (capped ~8M pairs): ~{est_test_8m:.1f} minutes")
     print(f"    - Test candidate pairs (uncapped ~70M pairs): ~{est_test_70m:.1f} minutes")
+
 
 def main():
     """
@@ -534,14 +686,14 @@ def main():
     if cache_dir is None:
         cache_dir = os.path.join(config.CACHE_DIR, "laptop_test") if args.laptop_test else config.CACHE_DIR
 
+    t_start = time.time()
     print(f"=== Step 6: Pairwise Feature Engineering ===")
     print(f"Split: {args.split}")
     print(f"Cache Directory: {cache_dir}")
     print(f"Total features configured: {len(config.FEATURES)}")
+    print(f"Initial RSS: {_rss_mb():.0f} MB", flush=True)
 
     # 0. For train split, load split.parquet to determine which S1 get features.
-    #    Blocking runs over ALL S1 (for realistic reverse_rank/Channel D),
-    #    features are computed for sampled S1 + competitor S1.
     sampled_s1_ids = None  # None means "keep all" (test split)
     val_s1_ids = None
     if args.split == "train":
@@ -550,7 +702,8 @@ def main():
             split_df = pd.read_parquet(split_path)
             sampled_s1_ids = set(split_df['s1_id'].values)
             val_s1_ids = set(split_df.loc[split_df['fold'] == 'val', 's1_id'].values)
-            print(f"Loaded split.parquet: {len(sampled_s1_ids):,} sampled S1 ({len(val_s1_ids):,} val S1) for feature extraction.")
+            print(f"Loaded split.parquet: {len(sampled_s1_ids):,} sampled S1 ({len(val_s1_ids):,} val S1) for feature extraction. "
+                  f"(RSS {_rss_mb():.0f} MB)", flush=True)
         else:
             print("WARNING: split.parquet not found; computing features for ALL S1.")
 
@@ -571,17 +724,42 @@ def main():
 
     print(f"Found {len(chunk_files)} candidate chunk file(s).")
 
-    # 2. Check resume status
+    # 2. Compute global reverse ranks and identify kept feature rows & needed IDs
+    chunk_rr_list, chunk_keep_masks, chunk_is_comps, needed_s1_ids, needed_cand_ids, counts_info = (
+        compute_global_reverse_ranks(cache_dir, args.split, chunk_files, sampled_s1_ids, val_s1_ids)
+    )
+
+    # 3. Print count report
+    print("\n" + "=" * 80)
+    print("STEP 6 FEATURE ROWS & ENTITY ID COUNT REPORT")
+    print("=" * 80)
+    print(f"Total Candidate Pairs in Chunks : {counts_info['total_candidate_rows']:,}")
+    print(f"Sampled Feature Rows            : {counts_info['sampled_feature_rows']:,}")
+    print(f"Competitor Feature Rows         : {counts_info['competitor_feature_rows']:,}")
+    print(f"Total Feature Rows Needed       : {counts_info['total_feature_rows']:,}")
+    print("-" * 80)
+    print(f"Unique Sampled S1 Entities      : {counts_info['unique_sampled_s1']:,}")
+    print(f"Unique Competitor S1 Entities   : {counts_info['unique_competitor_s1']:,}")
+    print(f"Total Unique S1 Entities Needed : {counts_info['unique_total_s1']:,}")
+    print("-" * 80)
+    print(f"Unique S2 Candidate Entities    : {counts_info['unique_s2_cands']:,}")
+    print(f"Unique S3 Candidate Entities    : {counts_info['unique_s3_cands']:,}")
+    print(f"Total Unique Candidates Needed  : {counts_info['unique_total_cands']:,}")
+    print("=" * 80 + "\n", flush=True)
+
+    if args.count_only:
+        print(f"--count-only flag passed: exiting after count report. Elapsed: {time.time() - t_start:.2f}s (RSS {_rss_mb():.0f} MB)")
+        return
+
+    # 4. Check resume status
     pending_chunks = []
     for idx, cf in enumerate(chunk_files):
-        # Naming: feats_<split>_<chunk>.parquet
         chunk_suffix = os.path.basename(cf).replace(f"cands_{args.split}_", "").replace(".parquet", "")
-        # e.g. chunk_suffix is 'chunk_0' or '0'
         out_name1 = f"feats_{args.split}_{chunk_suffix}.parquet"
         out_name2 = f"feats_{args.split}_{idx}.parquet"
         out_p1 = os.path.join(cache_dir, out_name1)
         out_p2 = os.path.join(cache_dir, out_name2)
-        
+
         if (os.path.exists(out_p1) or os.path.exists(out_p2)) and not args.force:
             print(f"Chunk {idx + 1}/{len(chunk_files)} already processed, skipping.")
         else:
@@ -600,91 +778,83 @@ def main():
         print_acceptance_report(df_full, elapsed_time=0.0)
         return
 
-    # 3. Load normalized entity tables and compute token document frequencies
-    t_start = time.time()
-    print("\nLoading normalized tables...")
-    s1_norm = load_norm_table(cache_dir, args.split, "source1")
-    s2_norm = load_norm_table(cache_dir, args.split, "source2")
-    s3_norm = load_norm_table(cache_dir, args.split, "source3")
+    if args.max_chunks is not None:
+        print(f"--max-chunks set to {args.max_chunks}: limiting processing to {args.max_chunks} chunk(s).", flush=True)
+        pending_chunks = pending_chunks[:args.max_chunks]
+
+    # 5. Address document frequencies (memory-light streaming / cached parquet)
+    t_df_start = time.time()
+    df_tokens = get_address_token_df(cache_dir, args.split)
+    print(f"Address document frequencies ready in {time.time() - t_df_start:.2f}s (RSS {_rss_mb():.0f} MB)", flush=True)
+
+    # 6. Load normalized entity tables restricted to only needed IDs and feature columns
+    t_norm = time.time()
+    print("\nLoading restricted normalized tables (only needed IDs & columns)...", flush=True)
+    s1_norm = load_norm_table(cache_dir, args.split, "source1", needed_ids=needed_s1_ids, columns=NEEDED_NORM_COLS)
+    print(f"  Loaded Source 1: {len(s1_norm):,} rows (RSS {_rss_mb():.0f} MB)", flush=True)
+
+    s2_norm = load_norm_table(cache_dir, args.split, "source2", needed_ids=needed_cand_ids, columns=NEEDED_NORM_COLS)
+    print(f"  Loaded Source 2: {len(s2_norm):,} rows (RSS {_rss_mb():.0f} MB)", flush=True)
+
+    s3_norm = load_norm_table(cache_dir, args.split, "source3", needed_ids=needed_cand_ids, columns=NEEDED_NORM_COLS)
+    print(f"  Loaded Source 3: {len(s3_norm):,} rows (RSS {_rss_mb():.0f} MB)", flush=True)
+
     cands_norm = pd.concat([s2_norm, s3_norm])
+    del s2_norm, s3_norm
+    import gc; gc.collect()
+    print(f"Restricted normalized tables ready in {time.time() - t_norm:.2f}s "
+          f"(total candidate records: {len(cands_norm):,}) (RSS {_rss_mb():.0f} MB)", flush=True)
 
-    print("Computing address token document frequencies across S1+S2+S3...")
-    df_tokens = compute_address_token_df(s1_norm, s2_norm, s3_norm)
+    # 7. Load candidate embeddings restricted to needed candidate IDs
+    t_emb = time.time()
+    print("\nLoading restricted candidate embeddings...", flush=True)
+    all_cand_emb, cand_id_map = load_candidate_embeddings(cache_dir, args.split, needed_cand_ids=needed_cand_ids)
+    print(f"Candidate embeddings ready: {len(all_cand_emb):,} vectors in {time.time() - t_emb:.2f}s "
+          f"(RSS {_rss_mb():.0f} MB)", flush=True)
 
-    print("Precomputing token sets and lengths...")
-    s1_norm['tok_set'] = [frozenset(str(x).split()) for x in s1_norm['name_full']]
-    cands_norm['tok_set'] = [frozenset(str(x).split()) for x in cands_norm['name_full']]
-
-    s1_norm['num_set'] = [frozenset(str(x).split()) if str(x).strip() else frozenset() for x in s1_norm['num_tokens']]
-    cands_norm['num_set'] = [frozenset(str(x).split()) if str(x).strip() else frozenset() for x in cands_norm['num_tokens']]
-
-    s1_norm['hc_set'] = [frozenset(str(x).split(';')) if str(x).strip() else frozenset() for x in s1_norm['house_cands']]
-    cands_norm['hc_set'] = [frozenset(str(x).split(';')) if str(x).strip() else frozenset() for x in cands_norm['house_cands']]
-
-    s1_norm['rare3_set'] = [extract_rare3_set(r['addr_norm'], r['country'], df_tokens) for _, r in s1_norm.iterrows()]
-    cands_norm['rare3_set'] = [extract_rare3_set(r['addr_norm'], r['country'], df_tokens) for _, r in cands_norm.iterrows()]
-
-    s1_norm['core_len'] = s1_norm['core_name'].str.len().astype(np.int32)
-    cands_norm['core_len'] = cands_norm['core_name'].str.len().astype(np.int32)
-
-    # 4. Load candidate embeddings
-    print("Loading candidate embedding arrays...")
-    all_cand_emb, cand_id_map = load_candidate_embeddings(cache_dir, args.split)
-
-    # 5. Compute global reverse rank across ALL candidate pairs (full competition)
-    #    and identify competitor S1s that share candidate(s) with val S1.
-    chunk_rr_list, competitor_s1_ids = compute_global_reverse_ranks(
-        cache_dir, args.split, chunk_files, sampled_s1_ids, val_s1_ids
-    )
-    print(f"Report: Competitor S1 count: {len(competitor_s1_ids):,}")
-
-    target_s1_ids = None
-    if sampled_s1_ids is not None:
-        target_s1_ids = sampled_s1_ids | competitor_s1_ids
-
-    # 6. Process each pending chunk — filter to sampled S1 + competitors (train) or all (test)
+    # 8. Process each pending chunk
     processed_feats = []
     t_feat_start = time.time()
     for idx, cf, out_p1, out_p2 in pending_chunks:
-        print(f"\nProcessing chunk {idx + 1}/{len(chunk_files)}: {cf}...")
+        print(f"\nProcessing chunk {idx + 1}/{len(chunk_files)}: {cf}...", flush=True)
         t_ch = time.time()
         chunk_cands = pd.read_parquet(cf)
         chunk_rr = chunk_rr_list[idx]
+        keep_mask = chunk_keep_masks[idx]
+        is_comp = chunk_is_comps[idx]
 
-        # Filter to sampled S1 + competitors (for train split)
-        if target_s1_ids is not None:
-            keep_mask = chunk_cands['s1_id'].isin(target_s1_ids)
-            n_before = len(chunk_cands)
-            chunk_cands = chunk_cands[keep_mask].reset_index(drop=True)
-            chunk_rr = chunk_rr[keep_mask.values]
-            chunk_cands['is_competitor'] = chunk_cands['s1_id'].isin(competitor_s1_ids).astype(np.int8)
-            print(f"  Filtered to sampled + competitor S1: {n_before} -> {len(chunk_cands)} candidate pairs")
-        else:
-            chunk_cands['is_competitor'] = np.zeros(len(chunk_cands), dtype=np.int8)
+        n_before = len(chunk_cands)
+        chunk_cands = chunk_cands[keep_mask].reset_index(drop=True)
+        chunk_rr = chunk_rr[keep_mask]
+        chunk_cands['is_competitor'] = is_comp[keep_mask].astype(np.int8)
+
+        print(f"  Filtered: {n_before:,} -> {len(chunk_cands):,} candidate pairs "
+              f"(sampled: {(chunk_cands['is_competitor'] == 0).sum():,}, "
+              f"competitor: {(chunk_cands['is_competitor'] == 1).sum():,})", flush=True)
 
         if len(chunk_cands) == 0:
-            print(f"  No sampled/competitor S1 in this chunk, skipping.")
-            # Write empty file so resume sees it as done
+            print(f"  No sampled/competitor S1 in this chunk, saving empty frame.")
             pd.DataFrame(columns=['s1_id', 'cand_id']).to_parquet(out_p1, index=False)
+            if out_p1 != out_p2:
+                pd.DataFrame(columns=['s1_id', 'cand_id']).to_parquet(out_p2, index=False)
             continue
 
         feats_df = compute_chunk_features(
-            chunk_cands, s1_norm, cands_norm, all_cand_emb, cand_id_map, chunk_rr
+            chunk_cands, s1_norm, cands_norm, all_cand_emb, cand_id_map, chunk_rr, df_tokens
         )
-        
-        # Save to both target naming formats for 100% compatibility
+
         feats_df.to_parquet(out_p1, index=False)
         if out_p1 != out_p2:
             feats_df.to_parquet(out_p2, index=False)
 
         rss_aft = _rss_mb()
-        print(f"Saved chunk features ({len(feats_df)} pairs) to {out_p1} "
+        print(f"Saved chunk {idx + 1} features ({len(feats_df):,} pairs) to {out_p1} "
               f"in {time.time() - t_ch:.2f}s  (RSS {rss_aft:.0f} MB)", flush=True)
         processed_feats.append(feats_df)
 
     t_feat_total = time.time() - t_feat_start
 
-    # 7. Merge all chunks for summary report and validation
+    # 9. Merge all chunks for summary report and validation
     all_feats = []
     for idx, cf in enumerate(chunk_files):
         chunk_suffix = os.path.basename(cf).replace(f"cands_{args.split}_", "").replace(".parquet", "")
@@ -705,6 +875,9 @@ def main():
         print_acceptance_report(df_full, elapsed_time=t_feat_total)
     else:
         print("No feature rows produced.")
+
+    print(f"\nStep 6 finished in {time.time() - t_start:.2f}s. Final RSS: {_rss_mb():.0f} MB", flush=True)
+
 
 if __name__ == "__main__":
     main()
