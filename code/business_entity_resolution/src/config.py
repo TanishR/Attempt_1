@@ -67,6 +67,8 @@ FEATURES = [
     "ch_skel",
     "ch_rare",
     "ch_rev",
+    "ch_rerank",
+    "ch_keyx",
     "n_channels",
     # Context Features
     "gap_to_best",
