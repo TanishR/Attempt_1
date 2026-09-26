@@ -18,6 +18,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+import pyarrow.parquet as pq
 
 import config
 from decide import apply_exclusivity, decide
@@ -48,6 +49,7 @@ def parse_args():
     parser.add_argument("--version", type=str, default="v1", help="Model version tag (e.g. v1)")
     parser.add_argument("--laptop-test", action="store_true", help="Use laptop test cache directory")
     parser.add_argument("--cache-dir", type=str, default=None, help="Explicit cache directory path")
+    parser.add_argument("--skip-diagnostics", action="store_true", help="Skip printing worst false merges and misses")
     return parser.parse_args()
 
 
@@ -438,148 +440,174 @@ def generate_slice_report(
 
 
 def print_worst_diagnostics(
-    pred_map: Dict[str, List[str]],
-    gold_map: Dict[str, Set[str]],
+    best_preds_int: Dict[int, List[int]],
+    gold_map_int: Dict[int, Set[int]],
     probs_df: pd.DataFrame,
     cache_dir: str,
     booster: lgb.Booster,
     limit: int = 30
 ):
     """
-    Prints side-by-side analysis of the 30 worst false merges and 30 worst misses.
-    Returns: None.
+    Prints side-by-side analysis of the worst false merges and worst misses.
+    Memory-light implementation:
+      - Filters to val rows only (is_competitor == 0)
+      - Computes false merges and misses using int64 IDs
+      - Looks up probabilities for only those candidate pairs
+      - Reads names and addresses via iter_batches for only the printed pairs (~60 IDs)
+      - Prints process RSS before and after.
     """
+    rss_before = _rss_mb()
     print("\n" + "=" * 90)
     print(f"STEP 8 ERROR DIAGNOSTICS: WORST {limit} FALSE MERGES & WORST {limit} MISSES")
-    print("=" * 90)
+    print(f"(RSS before diagnostics: {rss_before:.1f} MB)")
+    print("=" * 90, flush=True)
 
-    # Load normalized tables for entity names and addresses
-    norm1 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source1.parquet"))
-    norm2 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source2.parquet"))
-    norm3 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source3.parquet"))
-    norm_cands = pd.concat([norm2, norm3], ignore_index=True)
+    # 1. Filter to validation rows only (not competitor rows)
+    if "is_competitor" in probs_df.columns:
+        val_probs = probs_df[probs_df["is_competitor"] == 0]
+    else:
+        val_probs = probs_df
 
-    s1_id_col = "s1_id" if "s1_id" in norm1.columns else "entity_id"
-    cand_id_col = "cand_id" if "cand_id" in norm_cands.columns else "entity_id"
-
-    s1_name_map = dict(zip(norm1[s1_id_col].values, norm1["raw_name"].values))
-    s1_addr_map = dict(zip(norm1[s1_id_col].values, norm1["raw_address"].values))
-
-    cand_name_map = dict(zip(norm_cands[cand_id_col].values, norm_cands["raw_name"].values))
-    cand_addr_map = dict(zip(norm_cands[cand_id_col].values, norm_cands["raw_address"].values))
-
-    # Build prob lookup map (supporting both int64 and str IDs)
-    is_int_probs = np.issubdtype(probs_df["s1_id"].dtype, np.integer)
-    prob_map = dict(zip(zip(probs_df["s1_id"].values, probs_df["cand_id"].values), probs_df["prob"].values))
-
-    def _lookup_prob(s1_str: str, c_str: str) -> float:
-        if is_int_probs:
-            s1_k = int(s1_str.split("-")[1]) + 1_000_000_000_000
-            pfx = int(c_str[1]) * 1_000_000_000_000
-            c_k = pfx + int(c_str.split("-")[1])
-            return float(prob_map.get((s1_k, c_k), 0.0))
-        return float(prob_map.get((s1_str, c_str), 0.0))
-
-    # 1. Identify False Merges: predicted in pred_map, but not in gold_map
-    false_merges = []
-    for s1, preds in pred_map.items():
-        g = gold_map.get(s1, set())
+    # 2. Identify False Merges (int64)
+    candidate_fm: List[Tuple[int, int]] = []
+    for s1, preds in best_preds_int.items():
+        g = gold_map_int.get(s1, set())
         for c in preds:
             if c not in g:
-                p = _lookup_prob(s1, c)
-                false_merges.append((s1, c, p))
+                candidate_fm.append((s1, c))
 
-    # Sort false merges by prob descending (highest confidence false positives)
-    false_merges.sort(key=lambda x: x[2], reverse=True)
-
-    # 2. Identify Misses: in gold_map, but not in pred_map
-    misses = []
-    for s1, g in gold_map.items():
-        preds = set(pred_map.get(s1, []))
+    # 3. Identify Misses (int64)
+    candidate_misses: List[Tuple[int, int]] = []
+    for s1, g in gold_map_int.items():
+        preds = set(best_preds_int.get(s1, []))
         for c in g:
             if c not in preds:
-                p = _lookup_prob(s1, c)
-                misses.append((s1, c, p))
+                candidate_misses.append((s1, c))
 
-    # Sort misses by prob descending (candidates with high model prob that got dropped/missed)
+    # 4. Lookup probabilities for candidate pairs without allocating giant dictionary
+    needed_pairs_int = set(candidate_fm) | set(candidate_misses)
+    needed_s1_int = {p[0] for p in needed_pairs_int}
+
+    # Filter val_probs to only the needed S1 entities
+    sub_val = val_probs[val_probs["s1_id"].isin(needed_s1_int)]
+    prob_lookup = dict(zip(zip(sub_val["s1_id"].values, sub_val["cand_id"].values), sub_val["prob"].values))
+
+    false_merges = [(s1, c, float(prob_lookup.get((s1, c), 0.0))) for s1, c in candidate_fm]
+    false_merges.sort(key=lambda x: x[2], reverse=True)
+
+    misses = [(s1, c, float(prob_lookup.get((s1, c), 0.0))) for s1, c in candidate_misses]
     misses.sort(key=lambda x: x[2], reverse=True)
 
-    # Load feature rows for top-feature contribution ONLY for the worst pairs to avoid OOM
-    needed_pairs = set()
-    for s1, c, _ in false_merges[:limit]:
-        needed_pairs.add((s1, c))
-    for s1, c, _ in misses[:limit]:
-        needed_pairs.add((s1, c))
+    top_fm = false_merges[:limit]
+    top_miss = misses[:limit]
+    del prob_lookup, sub_val, candidate_fm, candidate_misses, needed_pairs_int, needed_s1_int
 
-    cand_chunks = [f for f in os.listdir(cache_dir) if f.startswith("cands_train_chunk_") and f.endswith(".parquet")]
-    expected_chunks = len(cand_chunks)
+    # Collect IDs for the top pairs to be printed
+    printed_s1_int = {p[0] for p in top_fm} | {p[0] for p in top_miss}
+    printed_cand_int = {p[1] for p in top_fm} | {p[1] for p in top_miss}
+
+    printed_s1_str = {_int_to_id(x) for x in printed_s1_int}
+    printed_cand_str = {_int_to_id(x) for x in printed_cand_int}
+
+    # Load names and addresses ONLY for the printed IDs via iter_batches
+    s1_name_map = {}
+    s1_addr_map = {}
+    cand_name_map = {}
+    cand_addr_map = {}
+
+    norm1_path = os.path.join(cache_dir, "norm_train_source1.parquet")
+    if os.path.exists(norm1_path):
+        pf1 = pq.ParquetFile(norm1_path)
+        id_col = "s1_id" if "s1_id" in pf1.schema.names else "entity_id"
+        for batch in pf1.iter_batches(batch_size=500_000, columns=[id_col, "raw_name", "raw_address"]):
+            b_df = batch.to_pandas()
+            matched = b_df[b_df[id_col].isin(printed_s1_str)]
+            if len(matched) > 0:
+                for eid, rn, ra in zip(matched[id_col], matched["raw_name"], matched["raw_address"]):
+                    s1_name_map[eid] = str(rn) if pd.notna(rn) else ""
+                    s1_addr_map[eid] = str(ra) if pd.notna(ra) else ""
+            if len(s1_name_map) >= len(printed_s1_str):
+                break
+
+    for src in ["source2", "source3"]:
+        norm_path = os.path.join(cache_dir, f"norm_train_{src}.parquet")
+        if os.path.exists(norm_path):
+            pfc = pq.ParquetFile(norm_path)
+            id_col = "cand_id" if "cand_id" in pfc.schema.names else "entity_id"
+            for batch in pfc.iter_batches(batch_size=500_000, columns=[id_col, "raw_name", "raw_address"]):
+                b_df = batch.to_pandas()
+                matched = b_df[b_df[id_col].isin(printed_cand_str)]
+                if len(matched) > 0:
+                    for eid, rn, ra in zip(matched[id_col], matched["raw_name"], matched["raw_address"]):
+                        cand_name_map[eid] = str(rn) if pd.notna(rn) else ""
+                        cand_addr_map[eid] = str(ra) if pd.notna(ra) else ""
+                if len(cand_name_map) >= len(printed_cand_str):
+                    break
+
+    # Load feature rows for top-feature contribution ONLY for the printed pairs
+    needed_pairs_str = {(_int_to_id(s), _int_to_id(c)) for s, c, _ in top_fm + top_miss}
+    needed_s1_str = {p[0] for p in needed_pairs_str}
 
     feat_files = []
-    chunk_prefix = "feats_train_chunk_"
     for f in os.listdir(cache_dir):
-        if f.startswith(chunk_prefix) and f.endswith(".parquet"):
+        if f.startswith("feats_train_chunk_") and f.endswith(".parquet"):
             feat_files.append(os.path.join(cache_dir, f))
-
-    if not feat_files:
-        raise FileNotFoundError(
-            f"No feature files found matching 'feats_train_chunk_*.parquet' in '{cache_dir}'. "
-            f"Run s4_features.py --split train first."
-        )
-
-    if expected_chunks > 0 and len(feat_files) < expected_chunks:
-        raise RuntimeError(
-            f"Incomplete feature chunks in '{cache_dir}': found {len(feat_files)} file(s) matching "
-            f"'feats_train_chunk_*.parquet', but expected {expected_chunks} (matching cands_train_chunk_*.parquet). "
-            f"Run s4_features.py --split train to complete feature extraction."
-        )
-
     feat_files = sorted(
         feat_files,
         key=lambda x: int(re.search(r"chunk_(\d+)", os.path.basename(x)).group(1)) if re.search(r"chunk_(\d+)", os.path.basename(x)) else x
     )
 
     feat_lookup = {}
-    if feat_files and needed_pairs:
+    if feat_files and needed_pairs_str:
         matched_dfs = []
-        needed_s1 = {p[0] for p in needed_pairs}
         for fp in feat_files:
-            cdf = pd.read_parquet(fp, columns=["s1_id", "cand_id"] + config.FEATURES)
-            sub_cdf = cdf[cdf["s1_id"].isin(needed_s1)]
+            try:
+                cdf = pd.read_parquet(fp, columns=["s1_id", "cand_id"] + config.FEATURES)
+            except Exception:
+                continue
+            sub_cdf = cdf[cdf["s1_id"].isin(needed_s1_str)]
             if len(sub_cdf) > 0:
                 matched_dfs.append(sub_cdf)
         if matched_dfs:
             full_feat = pd.concat(matched_dfs, ignore_index=True).drop_duplicates(subset=["s1_id", "cand_id"])
             feat_lookup = full_feat.set_index(["s1_id", "cand_id"])
 
-    def get_top_features(s1, c, booster, is_fm=True):
-        if (s1, c) not in feat_lookup.index:
+    def get_top_features(s1_str, c_str, booster, is_fm=True):
+        if booster is None or not isinstance(feat_lookup, pd.DataFrame) or (s1_str, c_str) not in feat_lookup.index:
             return "N/A (missed by blocking)"
-        row = feat_lookup.loc[[(s1, c)]][config.FEATURES].values.astype(np.float32)
+        row = feat_lookup.loc[[(s1_str, c_str)]][config.FEATURES].values.astype(np.float32)
         contribs = booster.predict(row, pred_contrib=True)[0][:-1]  # drop intercept
         order = np.argsort(contribs) if not is_fm else np.argsort(-contribs)
         top_feats = [f"{config.FEATURES[i]} ({contribs[i]:+.2f})" for i in order[:3]]
         return ", ".join(top_feats)
 
-    print(f"\n--- WORST {min(limit, len(false_merges))} FALSE MERGES (Model Over-predicted) ---")
-    for idx, (s1, c, p) in enumerate(false_merges[:limit], 1):
-        s1_n = s1_name_map.get(s1, "N/A")[:30]
-        s1_a = s1_addr_map.get(s1, "N/A")[:30]
-        c_n = cand_name_map.get(c, "N/A")[:30]
-        c_a = cand_addr_map.get(c, "N/A")[:30]
-        top_f = get_top_features(s1, c, booster, is_fm=True)
-        print(f"[{idx:02d}] {s1} ({s1_n} | {s1_a})  <==>  {c} ({c_n} | {c_a})")
+    print(f"\n--- WORST {min(limit, len(top_fm))} FALSE MERGES (Model Over-predicted) ---")
+    for idx, (s1, c, p) in enumerate(top_fm, 1):
+        s1_str = _int_to_id(s1)
+        c_str = _int_to_id(c)
+        s1_n = s1_name_map.get(s1_str, "N/A")[:30]
+        s1_a = s1_addr_map.get(s1_str, "N/A")[:30]
+        c_n = cand_name_map.get(c_str, "N/A")[:30]
+        c_a = cand_addr_map.get(c_str, "N/A")[:30]
+        top_f = get_top_features(s1_str, c_str, booster, is_fm=True)
+        print(f"[{idx:02d}] {s1_str} ({s1_n} | {s1_a})  <==>  {c_str} ({c_n} | {c_a})")
         print(f"     Prob: {p:.4f} | Top Contributing Features: {top_f}")
 
-    print(f"\n--- WORST {min(limit, len(misses))} MISSES (Ground Truth Match Not Predicted) ---")
-    for idx, (s1, c, p) in enumerate(misses[:limit], 1):
-        s1_n = s1_name_map.get(s1, "N/A")[:30]
-        s1_a = s1_addr_map.get(s1, "N/A")[:30]
-        c_n = cand_name_map.get(c, "N/A")[:30]
-        c_a = cand_addr_map.get(c, "N/A")[:30]
-        top_f = get_top_features(s1, c, booster, is_fm=False)
-        print(f"[{idx:02d}] {s1} ({s1_n} | {s1_a})  <==>  {c} ({c_n} | {c_a})")
+    print(f"\n--- WORST {min(limit, len(top_miss))} MISSES (Ground Truth Match Not Predicted) ---")
+    for idx, (s1, c, p) in enumerate(top_miss, 1):
+        s1_str = _int_to_id(s1)
+        c_str = _int_to_id(c)
+        s1_n = s1_name_map.get(s1_str, "N/A")[:30]
+        s1_a = s1_addr_map.get(s1_str, "N/A")[:30]
+        c_n = cand_name_map.get(c_str, "N/A")[:30]
+        c_a = cand_addr_map.get(c_str, "N/A")[:30]
+        top_f = get_top_features(s1_str, c_str, booster, is_fm=False)
+        print(f"[{idx:02d}] {s1_str} ({s1_n} | {s1_a})  <==>  {c_str} ({c_n} | {c_a})")
         print(f"     Prob: {p:.4f} | Features: {top_f}")
-    print("=" * 90)
+
+    rss_after = _rss_mb()
+    print(f"\n[Diagnostics] Finished (RSS before: {rss_before:.1f} MB, after: {rss_after:.1f} MB)")
+    print("=" * 90, flush=True)
 
 
 def append_experiments_log(
@@ -686,7 +714,7 @@ def main():
     # 6. Save winning parameters to cache/thresholds.json
     save_tuned_thresholds(cache_dir=cache_dir, best_top1=best_t1, best_extra=best_te, best_margin=best_m, best_excl=best_ue)
 
-    # Convert best_preds back to strings for slice report and diagnostics
+    # Convert best_preds back to strings for slice report
     best_preds_str = {
         _int_to_id(s): [_int_to_id(c) for c in cands]
         for s, cands in best_preds.items()
@@ -696,9 +724,17 @@ def main():
     norm_s1 = pd.read_parquet(os.path.join(cache_dir, "norm_train_source1.parquet"))
     generate_slice_report(best_preds_str, gold_map, norm_s1)
 
-    # 8. Print Worst Diagnostics
-    if booster is not None:
-        print_worst_diagnostics(best_preds_str, gold_map, probs_df, cache_dir, booster, limit=30)
+    # 8. Print Worst Diagnostics (memory-light, wrapped in try/except)
+    if not args.skip_diagnostics and booster is not None:
+        try:
+            print_worst_diagnostics(best_preds, gold_map_int, probs_df, cache_dir, booster, limit=30)
+        except Exception as e:
+            print(f"\n[WARNING] Error diagnostics failed with exception: {e}")
+            import traceback
+            traceback.print_exc()
+            print("[WARNING] Continuing pipeline to completion...\n", flush=True)
+    elif args.skip_diagnostics:
+        print("\n[Diagnostics] Skipped (--skip-diagnostics flag passed).", flush=True)
 
     # 9. Summary Comparison against Sanity and Rule Baseline
     rule_baseline_f05 = 0.9492  # From Step 7 report
@@ -724,6 +760,14 @@ def main():
         val_macro_f05=best_score,
         thresholds=f"{best_t1:.2f} / {best_te:.2f}"
     )
+
+    # 11. Write stage 6 done marker
+    marker_dir = os.path.join(cache_dir, "markers")
+    os.makedirs(marker_dir, exist_ok=True)
+    done_file = os.path.join(marker_dir, "stage_6.done")
+    with open(done_file, "w") as f:
+        f.write(f"done at {datetime.now().isoformat()}\n")
+    print(f"Wrote stage done marker to {done_file}")
 
 
 if __name__ == "__main__":

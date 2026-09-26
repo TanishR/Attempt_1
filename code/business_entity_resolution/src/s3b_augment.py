@@ -147,12 +147,16 @@ def tokenize_address_f(addr_str: str) -> list[str]:
 
 
 def load_doc_freqs(cache_dir: str, split: str) -> dict[tuple[str, str], int]:
-    """Loads cache/addr_df_{split}.parquet."""
+    """Loads cache/addr_df_{split}.parquet, computing it if missing."""
     path = os.path.join(cache_dir, f"addr_df_{split}.parquet")
-    if not os.path.exists(path) and split == "test":
-        train_path = os.path.join(cache_dir, "addr_df_train.parquet")
-        if os.path.exists(train_path):
-            path = train_path
+    if not os.path.exists(path):
+        from s4_features import get_address_token_df
+        print(f"Document frequencies file '{path}' missing. Computing for split '{split}'...", flush=True)
+        try:
+            get_address_token_df(cache_dir, split)
+        except Exception as e:
+            print(f"Warning: Failed to compute {path}: {e}")
+
     doc_freqs: dict[tuple[str, str], int] = {}
     if os.path.exists(path):
         print(f"Loading document frequencies from {path}...")

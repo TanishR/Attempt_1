@@ -117,10 +117,6 @@ def get_address_token_df(cache_dir: str, split: str):
     Returns: dict mapping country string to dict of {token: doc_count}.
     """
     addr_df_path = os.path.join(cache_dir, f"addr_df_{split}.parquet")
-    if not os.path.exists(addr_df_path) and split == "test":
-        train_path = os.path.join(cache_dir, "addr_df_train.parquet")
-        if os.path.exists(train_path):
-            addr_df_path = train_path
 
     if os.path.exists(addr_df_path):
         print(f"Loading cached address token document frequencies from {addr_df_path}...", flush=True)
@@ -133,23 +129,29 @@ def get_address_token_df(cache_dir: str, split: str):
               f"in {time.time() - t0:.2f}s (RSS {_rss_mb():.0f} MB)", flush=True)
         return df_tokens
 
-    print(f"Computing address token document frequencies across S1+S2+S3 (memory-light streaming)...", flush=True)
+    print(f"Computing address token document frequencies across S1+S2+S3 for split '{split}' (memory-light streaming)...", flush=True)
     t0 = time.time()
     counts = defaultdict(Counter)
 
     for src in ["source1", "source2", "source3"]:
         paths_to_try = [
             os.path.join(cache_dir, f"norm_{split}_{src}.parquet"),
-            os.path.join(cache_dir, f"norm_train_{src}.parquet"),
-            os.path.join(cache_dir, f"norm_{src}.parquet"),
+            os.path.join(config.CACHE_DIR, f"norm_{split}_{src}.parquet"),
         ]
+        # Only for non-test splits or fallback if standard norm_{src}.parquet exists
+        if split != "test":
+            paths_to_try.append(os.path.join(cache_dir, f"norm_{src}.parquet"))
+
         target_path = None
         for p in paths_to_try:
             if os.path.exists(p):
                 target_path = p
                 break
         if not target_path:
-            continue
+            raise FileNotFoundError(
+                f"Cannot compute address token DF for split '{split}': missing normalized table for {src}. "
+                f"Checked: {paths_to_try}. Never falling back to another split."
+            )
 
         pf = pq.ParquetFile(target_path)
         for batch in pf.iter_batches(batch_size=500_000, columns=['country', 'addr_norm']):
