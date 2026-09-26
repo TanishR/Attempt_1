@@ -520,7 +520,8 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
     ch_k3 = chunk_df.get('ch_k3', pd.Series(0, index=chunk_df.index)).values.astype(np.float32)
     ch_k5 = chunk_df.get('ch_k5', pd.Series(0, index=chunk_df.index)).values.astype(np.float32)
     ch_keyx = (ch_k1 + ch_k3 + ch_k5).astype(np.float32)
-    n_channels = (ch_emb + ch_addr + ch_skel + ch_rare + ch_rev + ch_rerank + ch_k1 + ch_k3 + ch_k5).astype(np.float32)
+    ch_comb = chunk_df.get('ch_comb', pd.Series(0, index=chunk_df.index)).values.astype(np.float32)
+    n_channels = (ch_emb + ch_addr + ch_skel + ch_rare + ch_rev + ch_rerank + ch_k1 + ch_k3 + ch_k5 + ch_comb).astype(np.float32)
 
     # 14. Per-S1 context features: precomputed on FULL candidate list per S1
     gap_to_best = ctx_gap_to_best
@@ -562,7 +563,7 @@ def compute_chunk_features(chunk_df, s1_df, cands_df, all_cand_emb, cand_id_map,
         'num_jaccard': num_jaccard, 'rare_tok_overlap': rare_tok_overlap, 'zip_match': zip_match,
         'state_match': state_match, 'addr_missing_any': addr_missing_any, 'cand_source': cand_source,
         'ch_emb': ch_emb, 'ch_addr': ch_addr, 'ch_skel': ch_skel, 'ch_rare': ch_rare, 'ch_rev': ch_rev,
-        'ch_rerank': ch_rerank, 'ch_keyx': ch_keyx,
+        'ch_rerank': ch_rerank, 'ch_keyx': ch_keyx, 'ch_comb': ch_comb,
         'n_channels': n_channels, 'gap_to_best': gap_to_best, 'n_cands': n_cands,
         'reverse_rank': reverse_rank, 'support': support
     }

@@ -13,23 +13,24 @@ Channels:
     - Keys K5, K3, K1 within country and per source.
     - Block size cap <= 50 (larger blocks dropped).
     - At most 10 per S1 per key, prioritized by emb_score.
+  Channel H (Combined Name + Address Embeddings, Optional):
+    - Active if cache/embc_{split}_{source}.npy exists for both S1 and target source.
+    - Top 20 nearest neighbors by combined embedding similarity (GPU chunked, score matrix <= 3 GB).
+    - Sets ch_comb = 1.
 
 Merge Rules:
-  - Add on top of existing candidate rows, max 20 extra per S1.
-  - Priority: number of new channels that found the pair, then F score, then emb_score.
+  - If Channel H active: extra cap is 30 per S1.
+    Priority: number of new channels, then ch_comb, then F score, then emb_score.
+  - If Channel H not active: extra cap is 20 per S1.
+    Priority: number of new channels, then F score, then emb_score.
   - Never remove or alter existing rows.
-  - New columns: ch_rerank, ch_k1, ch_k3, ch_k5 (int8; 0 for existing rows).
-  - New pairs get emb_score as stored embedding dot product, and emb_rank = 999.0.
+  - Columns: ch_rerank, ch_k1, ch_k3, ch_k5, and ch_comb (if H active).
 
-Safety:
-  - Requires cache/cands_backup_{split}/ containing all original chunk files.
-  - Idempotent: skips chunks that already have 'ch_rerank'.
-  - One chunk at a time, resuming gracefully.
-  - Peak RSS < 20 GB, GPU memory < 20 GB.
-
-Usage:
-  python code/business_entity_resolution/src/s3b_augment.py --split train [--laptop-test] [--max-chunks 1]
-  python code/business_entity_resolution/src/s3b_augment.py --split test
+Memory Optimization (Peak RSS < 18 GB):
+  - Embeddings loaded via mmap_mode='r' (float16).
+  - IDs kept as int64 via _id_to_int.
+  - Address tokens stored as compact (N, 24) int32 numpy arrays (no Python lists/sets).
+  - Intermediates explicitly freed with gc.collect() between channels and chunks.
 """
 
 from __future__ import annotations
@@ -38,10 +39,9 @@ import argparse
 import gc
 import glob
 import os
-import shutil
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -56,6 +56,34 @@ from config import CAND_CAP, EMB_DIM, K_PER_SOURCE
 def _rss_mb() -> float:
     """Returns current process Resident Set Size (RSS) in megabytes."""
     return psutil.Process().memory_info().rss / (1024.0 * 1024.0)
+
+
+# ==============================================================================
+# INT64 ID ENCODING / DECODING
+# ==============================================================================
+
+def _id_to_int_single(eid: str) -> int:
+    s = str(eid).strip()
+    prefix = int(s[1]) * 1_000_000_000_000
+    num = int(s.split("-", 1)[1])
+    return prefix + num
+
+
+def _id_to_int(series: pd.Series | np.ndarray) -> np.ndarray:
+    if isinstance(series, pd.Series):
+        s = series.astype(str)
+    else:
+        s = pd.Series(series).astype(str)
+    prefix = s.str[1].map({"1": 1_000_000_000_000, "2": 2_000_000_000_000, "3": 3_000_000_000_000}).astype(np.int64)
+    numeric = s.str.split("-", n=1).str[1].astype(np.int64)
+    return (prefix + numeric).values
+
+
+def _int_to_id(arr: np.ndarray | list[int]) -> list[str]:
+    a = np.asarray(arr, dtype=np.int64)
+    src = a // 1_000_000_000_000
+    num = a % 1_000_000_000_000
+    return [f"S{s}-{n}" for s, n in zip(src, num)]
 
 
 # ==============================================================================
@@ -138,35 +166,167 @@ def load_doc_freqs(cache_dir: str, split: str) -> dict[tuple[str, str], int]:
 
 
 # ==============================================================================
-# EMBEDDINGS LOADING HELPER
+# EMBEDDINGS LOADING HELPERS (MMAP)
 # ==============================================================================
 
-def load_embeddings(cache_dir: str, split: str, source: str) -> tuple[np.ndarray, dict[str, int], np.ndarray, np.ndarray, dict[str, int], np.ndarray]:
-    """Loads main and alt embeddings for source."""
+def load_embeddings_mmap(
+    cache_dir: str, split: str, source: str
+) -> tuple[np.ndarray, dict[int, int], np.ndarray, np.ndarray, dict[int, int], np.ndarray]:
+    """Loads main and alt name embeddings via mmap with int64 IDs."""
     m_p = os.path.join(cache_dir, f"emb_{split}_{source}.npy")
     m_id_p = os.path.join(cache_dir, f"ids_{split}_{source}.npy")
-    
+
     if not os.path.exists(m_p) or not os.path.exists(m_id_p):
-        return (np.zeros((0, EMB_DIM), dtype=np.float16), {}, np.array([], dtype=object),
-                np.zeros((0, EMB_DIM), dtype=np.float16), {}, np.array([], dtype=object))
-        
-    main_emb = np.load(m_p)
-    main_ids = np.load(m_id_p, allow_pickle=True)
-    main_map = {eid: idx for idx, eid in enumerate(main_ids)}
-    
+        return (
+            np.zeros((0, EMB_DIM), dtype=np.float16),
+            {},
+            np.array([], dtype=np.int64),
+            np.zeros((0, EMB_DIM), dtype=np.float16),
+            {},
+            np.array([], dtype=np.int64),
+        )
+
+    main_emb = np.load(m_p, mmap_mode="r")
+    main_ids_raw = np.load(m_id_p, allow_pickle=True)
+    main_ids_int = _id_to_int(main_ids_raw)
+    main_map = {int(eid_int): idx for idx, eid_int in enumerate(main_ids_int)}
+
     a_p = os.path.join(cache_dir, f"emb_{split}_{source}_alt.npy")
     a_id_p = os.path.join(cache_dir, f"ids_{split}_{source}_alt.npy")
-    
+
     if os.path.exists(a_p) and os.path.exists(a_id_p):
-        alt_emb = np.load(a_p)
-        alt_ids = np.load(a_id_p, allow_pickle=True)
-        alt_map = {eid: idx for idx, eid in enumerate(alt_ids)}
+        alt_emb = np.load(a_p, mmap_mode="r")
+        alt_ids_raw = np.load(a_id_p, allow_pickle=True)
+        alt_ids_int = _id_to_int(alt_ids_raw)
+        alt_map = {int(eid_int): idx for idx, eid_int in enumerate(alt_ids_int)}
     else:
         alt_emb = np.zeros((0, EMB_DIM), dtype=np.float16)
-        alt_ids = np.array([], dtype=object)
+        alt_ids_int = np.array([], dtype=np.int64)
         alt_map = {}
-        
-    return main_emb, main_map, main_ids, alt_emb, alt_map, alt_ids
+
+    return main_emb, main_map, main_ids_int, alt_emb, alt_map, alt_ids_int
+
+
+def load_combined_embeddings_mmap(
+    cache_dir: str, split: str, source: str
+) -> tuple[Optional[np.ndarray], dict[int, int]]:
+    """Loads combined name+address embeddings via mmap with int64 IDs if available."""
+    alias_map = {"source1": "s1", "source2": "s2", "source3": "s3"}
+    s_alt = alias_map.get(source, source)
+
+    c_paths = [
+        (os.path.join(cache_dir, f"embc_{split}_{source}.npy"), os.path.join(cache_dir, f"idsc_{split}_{source}.npy")),
+        (os.path.join(cache_dir, f"embc_{split}_{s_alt}.npy"), os.path.join(cache_dir, f"idsc_{split}_{s_alt}.npy")),
+    ]
+
+    for emb_p, ids_p in c_paths:
+        if os.path.exists(emb_p) and os.path.exists(ids_p):
+            embc = np.load(emb_p, mmap_mode="r")
+            idsc_raw = np.load(ids_p, allow_pickle=True)
+            idsc_int = _id_to_int(idsc_raw)
+            comb_map = {int(eid_int): idx for idx, eid_int in enumerate(idsc_int)}
+            print(f"Loaded Channel H combined embeddings for {source} from {emb_p} ({len(idsc_int):,} vectors)")
+            return embc, comb_map
+
+    return None, {}
+
+
+# ==============================================================================
+# S2 & S3 TARGET INDEX PREPARATION
+# ==============================================================================
+
+class TargetSourceIndex:
+    """Precomputed target index for a source (source2 or source3)."""
+
+    def __init__(
+        self,
+        source_name: str,
+        df: pd.DataFrame,
+        main_emb: np.ndarray,
+        main_map: dict[int, int],
+        main_ids_int: np.ndarray,
+        alt_emb: np.ndarray,
+        alt_map: dict[int, int],
+        alt_ids_int: np.ndarray,
+        doc_freqs: dict[tuple[str, str], int],
+        global_tok_to_id: dict[str, int],
+        global_id_to_tok: list[str],
+        max_pad_len: int = 24,
+    ) -> None:
+        self.source_name = source_name
+        self.max_pad_len = max_pad_len
+        self.main_emb = main_emb
+        self.main_map = main_map
+        self.main_ids_int = main_ids_int
+        self.alt_emb = alt_emb
+        self.alt_map = alt_map
+        self.alt_ids_int = alt_ids_int
+
+        # int64 entity IDs and metadata
+        self.entity_ids_int = _id_to_int(df["entity_id"])
+        self.countries = df["country"].astype(str).values
+        self.id_to_row_idx = {int(eid): idx for idx, eid in enumerate(self.entity_ids_int)}
+
+        # Country partitions (local indices)
+        self.cand_indices_by_country: dict[str, list[int]] = defaultdict(list)
+        for idx, c in enumerate(self.countries):
+            c_str = c.strip()
+            if c_str:
+                self.cand_indices_by_country[c_str].append(idx)
+
+        # Build compact int32 address token matrix for Channel F
+        print(f"Building compact int32 token array for {source_name} Channel F...", flush=True)
+        t_tok0 = time.time()
+        ad_arr = df["addr_norm"].to_numpy() if "addr_norm" in df else np.array([""] * len(df))
+        self.cand_token_matrix = np.zeros((len(df), max_pad_len), dtype=np.int32)
+
+        for i, a_str in enumerate(ad_arr):
+            toks = tokenize_address_f(str(a_str))[:max_pad_len]
+            for pos, t in enumerate(toks):
+                if t not in global_tok_to_id:
+                    tid = len(global_id_to_tok)
+                    global_tok_to_id[t] = tid
+                    global_id_to_tok.append(t)
+                self.cand_token_matrix[i, pos] = global_tok_to_id[t]
+
+        print(f"  Token array shape {self.cand_token_matrix.shape} built in {time.time() - t_tok0:.1f}s | RSS: {_rss_mb():.1f} MB", flush=True)
+
+        # Inverted index for Channel G (K5, K3, K1) with int64 IDs
+        print(f"Building Channel G inverted indices for {source_name}...", flush=True)
+        t0 = time.time()
+        raw_k1: dict[str, list[int]] = defaultdict(list)
+        raw_k3: dict[str, list[int]] = defaultdict(list)
+        raw_k5: dict[str, list[int]] = defaultdict(list)
+
+        num_arr = df["num_tokens"].to_numpy() if "num_tokens" in df else np.array([""] * len(df))
+
+        for eid_int, ctry, num, ad in zip(self.entity_ids_int, self.countries, num_arr, ad_arr):
+            c = ctry.strip()
+            if not c:
+                continue
+            n_str = str(num).strip()
+            a_str = str(ad).strip()
+
+            eid_val = int(eid_int)
+            for k in extract_k1(c, n_str):
+                raw_k1[k].append(eid_val)
+            for k in extract_k3(c, n_str):
+                raw_k3[k].append(eid_val)
+            for k in extract_k5(c, n_str, a_str, doc_freqs):
+                raw_k5[k].append(eid_val)
+
+        # Prune blocks larger than 50 and convert to compact int64 arrays
+        self.k1_index = {k: np.array(v, dtype=np.int64) for k, v in raw_k1.items() if len(v) <= 50}
+        self.k3_index = {k: np.array(v, dtype=np.int64) for k, v in raw_k3.items() if len(v) <= 50}
+        self.k5_index = {k: np.array(v, dtype=np.int64) for k, v in raw_k5.items() if len(v) <= 50}
+        print(f"  {source_name} Channel G indices built in {time.time() - t0:.1f}s | "
+              f"K1={len(self.k1_index):,} (dropped {len(raw_k1) - len(self.k1_index):,}), "
+              f"K3={len(self.k3_index):,} (dropped {len(raw_k3) - len(self.k3_index):,}), "
+              f"K5={len(self.k5_index):,} (dropped {len(raw_k5) - len(self.k5_index):,}) | "
+              f"RSS: {_rss_mb():.1f} MB", flush=True)
+
+        del raw_k1, raw_k3, raw_k5, num_arr, ad_arr
+        gc.collect()
 
 
 # ==============================================================================
@@ -204,93 +364,6 @@ def verify_backup_safety(cache_dir: str, split: str) -> list[str]:
 
 
 # ==============================================================================
-# S2 & S3 TARGET INDEX PREPARATION
-# ==============================================================================
-
-class TargetSourceIndex:
-    """Precomputed target index for a source (source2 or source3)."""
-
-    def __init__(
-        self,
-        source_name: str,
-        df: pd.DataFrame,
-        main_emb: np.ndarray,
-        main_map: dict[str, int],
-        main_ids: np.ndarray,
-        alt_emb: np.ndarray,
-        alt_map: dict[str, int],
-        alt_ids: np.ndarray,
-        doc_freqs: dict[tuple[str, str], int],
-        max_pad_len: int = 24,
-    ) -> None:
-        self.source_name = source_name
-        self.max_pad_len = max_pad_len
-        self.main_emb = main_emb
-        self.main_map = main_map
-        self.main_ids = main_ids
-        self.alt_emb = alt_emb
-        self.alt_map = alt_map
-        self.alt_ids = alt_ids
-        
-        # Candidate table data
-        self.df = df
-        self.entity_ids = df["entity_id"].values
-        self.countries = df["country"].values
-        self.id_to_row_idx = {eid: idx for idx, eid in enumerate(self.entity_ids)}
-
-        # Country partitions
-        self.cand_indices_by_country: dict[str, list[int]] = defaultdict(list)
-        for idx, c in enumerate(self.countries):
-            c_str = str(c).strip()
-            if c_str:
-                self.cand_indices_by_country[c_str].append(idx)
-
-        # Inverted index for Channel G (K5, K3, K1)
-        print(f"Building Channel G inverted indices for {source_name}...", flush=True)
-        t0 = time.time()
-        raw_k1: dict[str, list[str]] = defaultdict(list)
-        raw_k3: dict[str, list[str]] = defaultdict(list)
-        raw_k5: dict[str, list[str]] = defaultdict(list)
-        
-        num_arr = df["num_tokens"].to_numpy() if "num_tokens" in df else np.array([""] * len(df))
-        ad_arr = df["addr_norm"].to_numpy() if "addr_norm" in df else np.array([""] * len(df))
-
-        for eid, ctry, num, ad in zip(self.entity_ids, self.countries, num_arr, ad_arr):
-            c = str(ctry).strip()
-            if not c:
-                continue
-            n_str = str(num).strip()
-            a_str = str(ad).strip()
-            
-            # K1
-            for k in extract_k1(c, n_str):
-                raw_k1[k].append(eid)
-            # K3
-            for k in extract_k3(c, n_str):
-                raw_k3[k].append(eid)
-            # K5
-            for k in extract_k5(c, n_str, a_str, doc_freqs):
-                raw_k5[k].append(eid)
-
-        # Prune blocks larger than 50
-        self.k1_index = {k: v for k, v in raw_k1.items() if len(v) <= 50}
-        self.k3_index = {k: v for k, v in raw_k3.items() if len(v) <= 50}
-        self.k5_index = {k: v for k, v in raw_k5.items() if len(v) <= 50}
-        print(f"  {source_name} Channel G indices built in {time.time() - t0:.1f}s | "
-              f"K1={len(self.k1_index):,} (dropped {len(raw_k1) - len(self.k1_index):,}), "
-              f"K3={len(self.k3_index):,} (dropped {len(raw_k3) - len(self.k3_index):,}), "
-              f"K5={len(self.k5_index):,} (dropped {len(raw_k5) - len(self.k5_index):,}) | "
-              f"RSS: {_rss_mb():.1f} MB", flush=True)
-        del raw_k1, raw_k3, raw_k5
-        gc.collect()
-
-        # Token arrays for Channel F address re-ranking
-        print(f"Tokenizing addresses for {source_name} Channel F...", flush=True)
-        self.toks_list = [tokenize_address_f(a) for a in ad_arr]
-        print(f"  Tokenized {len(self.toks_list):,} addresses (RSS: {_rss_mb():.1f} MB)", flush=True)
-
-
-# ==============================================================================
 # MAIN AUGMENTATION PIPELINE
 # ==============================================================================
 
@@ -301,7 +374,7 @@ def run_augmentation(
     max_chunks: Optional[int] = None,
     batch_size: int = 5000,
 ) -> None:
-    """Executes Stage 3b candidate augmentation chunk by chunk."""
+    """Executes Stage 3b candidate augmentation chunk by chunk with minimal RSS."""
     total_start = time.time()
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"\n=== Running Stage 3b Candidate Augmentation ({split.upper()}) ===")
@@ -314,12 +387,16 @@ def run_augmentation(
     # 1. Load document frequencies
     doc_freqs = load_doc_freqs(cache_dir, split)
 
-    # 2. Load Source 2 & Source 3 normalized tables
+    # Global token vocabulary for compact int32 token arrays (index 0 = padding)
+    global_tok_to_id: dict[str, int] = {}
+    global_id_to_tok: list[str] = ["<PAD>"]
+
+    # 2. Load Source 2 & Source 3 normalized tables (only needed columns)
     print("\nLoading normalized tables for Source 2 and Source 3...")
     cols = ["entity_id", "country", "num_tokens", "addr_norm"]
     p_s2 = os.path.join(cache_dir, f"norm_{split}_source2.parquet")
     p_s3 = os.path.join(cache_dir, f"norm_{split}_source3.parquet")
-    
+
     def _read_norm_cols(p: str) -> pd.DataFrame:
         if not os.path.exists(p):
             return pd.DataFrame(columns=cols)
@@ -331,57 +408,88 @@ def run_augmentation(
     df_s3 = _read_norm_cols(p_s3)
     print(f"Loaded normalized records: S2={len(df_s2):,}, S3={len(df_s3):,} (RSS: {_rss_mb():.1f} MB)")
 
-    # 3. Load embeddings for Source 2 & Source 3
-    print("Loading embeddings for Source 2 and Source 3...")
-    s2_m_emb, s2_m_map, s2_m_ids, s2_a_emb, s2_a_map, s2_a_ids = load_embeddings(cache_dir, split, "source2")
-    s3_m_emb, s3_m_map, s3_m_ids, s3_a_emb, s3_a_map, s3_a_ids = load_embeddings(cache_dir, split, "source3")
-    print(f"Loaded embedding vectors (RSS: {_rss_mb():.1f} MB)")
+    # 3. Load name embeddings for Source 2 & Source 3 via mmap
+    print("Memory-mapping name embeddings for Source 2 and Source 3...")
+    s2_m_emb, s2_m_map, s2_m_ids, s2_a_emb, s2_a_map, s2_a_ids = load_embeddings_mmap(cache_dir, split, "source2")
+    s3_m_emb, s3_m_map, s3_m_ids, s3_a_emb, s3_a_map, s3_a_ids = load_embeddings_mmap(cache_dir, split, "source3")
+    print(f"Name embeddings mapped (RSS: {_rss_mb():.1f} MB)")
 
-    # 4. Build Target Indices for S2 and S3
-    idx_s2 = TargetSourceIndex("source2", df_s2, s2_m_emb, s2_m_map, s2_m_ids, s2_a_emb, s2_a_map, s2_a_ids, doc_freqs)
-    idx_s3 = TargetSourceIndex("source3", df_s3, s3_m_emb, s3_m_map, s3_m_ids, s3_a_emb, s3_a_map, s3_a_ids, doc_freqs)
+    # 4. Check & Load Channel H combined embeddings if present
+    print("Checking for Channel H combined embeddings...")
+    s1_comb_emb, s1_comb_map = load_combined_embeddings_mmap(cache_dir, split, "source1")
+    s2_comb_emb, s2_comb_map = load_combined_embeddings_mmap(cache_dir, split, "source2")
+    s3_comb_emb, s3_comb_map = load_combined_embeddings_mmap(cache_dir, split, "source3")
+
+    channel_h_active_s2 = (s1_comb_emb is not None) and (s2_comb_emb is not None)
+    channel_h_active_s3 = (s1_comb_emb is not None) and (s3_comb_emb is not None)
+    channel_h_any_active = channel_h_active_s2 or channel_h_active_s3
+
+    if channel_h_any_active:
+        print(f"Channel H active (S2={channel_h_active_s2}, S3={channel_h_active_s3})! Extra candidate cap = 30.")
+    else:
+        print("Channel H combined embeddings not found. Extra candidate cap = 20.")
+
+    # 5. Build Target Indices for S2 and S3
+    idx_s2 = TargetSourceIndex(
+        "source2", df_s2, s2_m_emb, s2_m_map, s2_m_ids, s2_a_emb, s2_a_map, s2_a_ids,
+        doc_freqs, global_tok_to_id, global_id_to_tok
+    )
+    idx_s3 = TargetSourceIndex(
+        "source3", df_s3, s3_m_emb, s3_m_map, s3_m_ids, s3_a_emb, s3_a_map, s3_a_ids,
+        doc_freqs, global_tok_to_id, global_id_to_tok
+    )
     del df_s2, df_s3
     gc.collect()
+    print(f"Target indices built (RSS: {_rss_mb():.1f} MB)")
 
-    # 5. Load S1 normalized table and embeddings
-    print("\nLoading Source 1 normalized table and embeddings...")
+    # 6. Load Source 1 metadata and name embeddings via mmap
+    print("\nLoading Source 1 metadata and embeddings...")
     p_s1 = os.path.join(cache_dir, f"norm_{split}_source1.parquet")
     s1_norm = _read_norm_cols(p_s1)
-    s1_norm_map = {r["entity_id"]: r for r in s1_norm.to_dict("records")}
-    s1_m_emb, s1_m_map, s1_m_ids, s1_a_emb, s1_a_map, s1_a_ids = load_embeddings(cache_dir, split, "source1")
-    print(f"Loaded Source 1: {len(s1_norm):,} records (RSS: {_rss_mb():.1f} MB)")
+    s1_norm["s1_int"] = _id_to_int(s1_norm["entity_id"])
+    s1_meta_by_int = dict(zip(s1_norm["s1_int"], zip(s1_norm["country"], s1_norm["num_tokens"], s1_norm["addr_norm"])))
+    s1_m_emb, s1_m_map, s1_m_ids, s1_a_emb, s1_a_map, s1_a_ids = load_embeddings_mmap(cache_dir, split, "source1")
+    del s1_norm
+    gc.collect()
+    print(f"Loaded Source 1: {len(s1_meta_by_int):,} records (RSS: {_rss_mb():.1f} MB)")
 
-    # 6. Load Ground Truth for label assignment if train
-    gt_pairs: set[tuple[str, str]] = set()
+    # 7. Load Ground Truth for label assignment if train
+    gt_pairs_int: set[tuple[int, int]] = set()
     if split == "train":
         gt_path = os.path.join(cache_dir, "gt_long.parquet")
         if os.path.exists(gt_path):
             gt_df = pd.read_parquet(gt_path, columns=["s1_id", "match_id"])
-            gt_pairs = set(zip(gt_df["s1_id"], gt_df["match_id"]))
-            print(f"Loaded ground truth: {len(gt_pairs):,} pairs")
+            s1_i = _id_to_int(gt_df["s1_id"])
+            m_i = _id_to_int(gt_df["match_id"])
+            gt_pairs_int = set(zip(s1_i, m_i))
+            del gt_df, s1_i, m_i
+            print(f"Loaded ground truth: {len(gt_pairs_int):,} pairs")
 
-    # 7. Helper: compute pairwise dot product embedding score
-    def _calc_emb_score(s1_id: str, cand_id: str, is_s2: bool) -> float:
+    # Pairwise embedding dot product helper
+    def _calc_emb_score(s1_int: int, cand_int: int, is_s2: bool) -> float:
         cm_emb, cm_map, ca_emb, ca_map = (s2_m_emb, s2_m_map, s2_a_emb, s2_a_map) if is_s2 else (s3_m_emb, s3_m_map, s3_a_emb, s3_a_map)
-        if s1_id not in s1_m_map or cand_id not in cm_map:
+        if s1_int not in s1_m_map or cand_int not in cm_map:
             return 0.0
-        v1_m = s1_m_emb[s1_m_map[s1_id]].astype(np.float32)
-        v2_m = cm_emb[cm_map[cand_id]].astype(np.float32)
+        v1_m = s1_m_emb[s1_m_map[s1_int]].astype(np.float32)
+        v2_m = cm_emb[cm_map[cand_int]].astype(np.float32)
         best_s = float(np.dot(v1_m, v2_m))
-        
-        has_s1_a = s1_id in s1_a_map
-        has_c_a = cand_id in ca_map
+
+        has_s1_a = s1_int in s1_a_map
+        has_c_a = cand_int in ca_map
         if has_c_a:
-            v2_a = ca_emb[ca_map[cand_id]].astype(np.float32)
+            v2_a = ca_emb[ca_map[cand_int]].astype(np.float32)
             s_ma = float(np.dot(v1_m, v2_a))
-            if s_ma > best_s: best_s = s_ma
+            if s_ma > best_s:
+                best_s = s_ma
         if has_s1_a:
-            v1_a = s1_a_emb[s1_a_map[s1_id]].astype(np.float32)
+            v1_a = s1_a_emb[s1_a_map[s1_int]].astype(np.float32)
             s_am = float(np.dot(v1_a, v2_m))
-            if s_am > best_s: best_s = s_am
+            if s_am > best_s:
+                best_s = s_am
             if has_c_a:
                 s_aa = float(np.dot(v1_a, v2_a))
-                if s_aa > best_s: best_s = s_aa
+                if s_aa > best_s:
+                    best_s = s_aa
         return best_s
 
     # 8. Process each chunk
@@ -390,329 +498,427 @@ def run_augmentation(
         t_ch_start = time.time()
         print(f"\n--- Chunk {ch_idx + 1}/{len(chunk_files)}: {chunk_path} ---", flush=True)
 
-        # Check idempotence: if already has ch_rerank, skip
         pf = pq.ParquetFile(chunk_path)
-        if "ch_rerank" in pf.schema.names:
-            print(f"Chunk already contains 'ch_rerank', skipping (idempotent).")
+        has_rerank = "ch_rerank" in pf.schema.names
+        has_comb = "ch_comb" in pf.schema.names
+
+        # Case 1: Fully augmented (both markers present)
+        if has_rerank and has_comb:
+            print("  Chunk already contains 'ch_rerank' and 'ch_comb', skipping (idempotent).")
             continue
+
+        # Case 2: Chunk has ch_rerank but NOT ch_comb (Channel H only)
+        # Case 3: Fresh chunk without ch_rerank (Run F, G, and if active H)
+        run_fg = not has_rerank
+        run_h = channel_h_any_active and (not has_comb)
+        extra_cap = 30 if channel_h_any_active else 20
 
         chunk_df = pd.read_parquet(chunk_path)
         existing_rows_count = len(chunk_df)
-        chunk_s1_ids = chunk_df["s1_id"].unique()
-        print(f"  Existing rows: {existing_rows_count:,} across {len(chunk_s1_ids):,} unique S1s (RSS: {_rss_mb():.1f} MB)")
 
-        # Map existing candidates per S1
-        existing_cands_map: dict[str, set[str]] = defaultdict(set)
-        for s1, cid in zip(chunk_df["s1_id"], chunk_df["cand_id"]):
-            existing_cands_map[s1].add(cid)
+        s1_ints = _id_to_int(chunk_df["s1_id"])
+        cand_ints = _id_to_int(chunk_df["cand_id"])
+        chunk_s1_ids_order = pd.unique(chunk_df["s1_id"])
+        chunk_s1_ints_unique = _id_to_int(chunk_s1_ids_order)
+        print(f"  Existing rows: {existing_rows_count:,} across {len(chunk_s1_ints_unique):,} unique S1s (RSS: {_rss_mb():.1f} MB)")
 
-        # Group this chunk's S1 IDs by country
-        s1_by_country: dict[str, list[str]] = defaultdict(list)
-        for sid in chunk_s1_ids:
-            r = s1_norm_map.get(sid)
-            c = str(r.get("country", "")).strip() if r else ""
+        # Map existing candidates and existing extra count per S1
+        existing_cands_map: dict[int, set[int]] = defaultdict(set)
+        existing_extra_count: dict[int, int] = defaultdict(int)
+
+        if has_rerank:
+            rr_arr = chunk_df["ch_rerank"].values
+            k1_arr = chunk_df["ch_k1"].values if "ch_k1" in chunk_df.columns else np.zeros(len(chunk_df))
+            k3_arr = chunk_df["ch_k3"].values if "ch_k3" in chunk_df.columns else np.zeros(len(chunk_df))
+            k5_arr = chunk_df["ch_k5"].values if "ch_k5" in chunk_df.columns else np.zeros(len(chunk_df))
+            for s1_i, cid_i, rrk, k1, k3, k5 in zip(s1_ints, cand_ints, rr_arr, k1_arr, k3_arr, k5_arr):
+                existing_cands_map[int(s1_i)].add(int(cid_i))
+                if rrk > 0 or k1 > 0 or k3 > 0 or k5 > 0:
+                    existing_extra_count[int(s1_i)] += 1
+        else:
+            for s1_i, cid_i in zip(s1_ints, cand_ints):
+                existing_cands_map[int(s1_i)].add(int(cid_i))
+
+        # Group S1 IDs by country
+        s1_by_country: dict[str, list[int]] = defaultdict(list)
+        for sid_int in chunk_s1_ints_unique:
+            meta = s1_meta_by_int.get(int(sid_int))
+            c = str(meta[0]).strip() if meta else ""
             if c:
-                s1_by_country[c].append(sid)
+                s1_by_country[c].append(int(sid_int))
 
-        # Candidate collectors for this chunk: s1_id -> cand_id -> candidate dict
-        # candidate dict: {'ch_rerank': 0, 'ch_k1': 0, 'ch_k3': 0, 'ch_k5': 0, 'f_score': 0.0, 'emb_score': float, 'is_s2': bool}
-        augmented_candidates: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+        # Candidate collectors for this chunk: s1_int -> cand_int -> candidate dict
+        augmented_candidates: dict[int, dict[int, dict[str, Any]]] = defaultdict(dict)
 
         # ----------------------------------------------------------------------
         # CHANNEL F: Wide Retrieval (top 200) + Address Re-ranking (GPU)
         # ----------------------------------------------------------------------
-        print(f"  Running Channel F (Wide 200 + GPU Re-ranking)...", flush=True)
-        t_f0 = time.time()
-        
-        for ctry, s1_ids_c in s1_by_country.items():
-            for target_idx, is_s2 in [(idx_s2, True), (idx_s3, False)]:
-                cand_pool_indices = target_idx.cand_indices_by_country.get(ctry, [])
-                if not cand_pool_indices or not s1_ids_c:
-                    continue
+        if run_fg:
+            print(f"  Running Channel F (Wide 200 + GPU Re-ranking)...", flush=True)
+            t_f0 = time.time()
 
-                cand_ids_pool = target_idx.entity_ids[cand_pool_indices]
-                
-                # Stack target embeddings (main + alt)
-                c_m_indices = [target_idx.main_map[cid] for cid in cand_ids_pool if cid in target_idx.main_map]
-                X_main = target_idx.main_emb[c_m_indices]
-                X_main_cids = cand_ids_pool[[cid in target_idx.main_map for cid in cand_ids_pool]]
-
-                c_a_cids = [cid for cid in cand_ids_pool if cid in target_idx.alt_map]
-                if c_a_cids:
-                    c_a_indices = [target_idx.alt_map[cid] for cid in c_a_cids]
-                    X_alt = target_idx.alt_emb[c_a_indices]
-                    X_alt_cids = np.array(c_a_cids, dtype=object)
-                    X_stacked = np.vstack([X_main, X_alt])
-                    row_to_cid = np.concatenate([X_main_cids, X_alt_cids])
-                else:
-                    X_stacked = X_main
-                    row_to_cid = X_main_cids
-
-                N_index = len(X_stacked)
-                if N_index == 0:
-                    continue
-
-                X_gpu = torch.from_numpy(X_stacked).to(device)
-                k_search = min(200, N_index)
-
-                # Token vocabulary & IDF for this country
-                max_docs_ctry = max(1, len(cand_pool_indices))
-                tok_to_id: dict[str, int] = {}
-                idf_weights_list: list[float] = [0.0]  # index 0 = padding
-                
-                # Build token arrays for candidates in pool
-                cand_token_matrix = np.zeros((len(cand_pool_indices), 24), dtype=np.int32)
-                for local_i, global_i in enumerate(cand_pool_indices):
-                    toks = target_idx.toks_list[global_i][:24]
-                    for t_pos, t_str in enumerate(toks):
-                        if t_str not in tok_to_id:
-                            tid = len(tok_to_id) + 1
-                            tok_to_id[t_str] = tid
-                            df_val = doc_freqs.get((ctry, t_str), 0)
-                            idf_val = float(np.log(1.0 + (max_docs_ctry + 1.0) / (df_val + 1.0)))
-                            idf_weights_list.append(idf_val)
-                        cand_token_matrix[local_i, t_pos] = tok_to_id[t_str]
-
-                cand_id_to_pool_idx = {cid: idx for idx, cid in enumerate(cand_ids_pool)}
-                idf_weights_tensor = torch.tensor(idf_weights_list, dtype=torch.float32, device=device)
-
-                # Build token array & weights for S1 queries in this country
-                s1_token_matrix = np.zeros((len(s1_ids_c), 24), dtype=np.int32)
-                s1_weights_matrix = np.zeros((len(s1_ids_c), 24), dtype=np.float32)
-                for q_i, sid in enumerate(s1_ids_c):
-                    r_s1 = s1_norm_map.get(sid, {})
-                    ad_s1 = r_s1.get("addr_norm", "")
-                    toks_s1 = tokenize_address_f(ad_s1)[:24]
-                    for t_pos, t_str in enumerate(toks_s1):
-                        if t_str not in tok_to_id:
-                            tid = len(tok_to_id) + 1
-                            tok_to_id[t_str] = tid
-                            df_val = doc_freqs.get((ctry, t_str), 0)
-                            idf_val = float(np.log(1.0 + (max_docs_ctry + 1.0) / (df_val + 1.0)))
-                            idf_weights_list.append(idf_val)
-                        t_id = tok_to_id[t_str]
-                        s1_token_matrix[q_i, t_pos] = t_id
-                        s1_weights_matrix[q_i, t_pos] = idf_weights_list[t_id]
-
-                # Update idf tensor if new S1 tokens added
-                if len(idf_weights_list) > len(idf_weights_tensor):
-                    idf_weights_tensor = torch.tensor(idf_weights_list, dtype=torch.float32, device=device)
-
-                # Calculate query chunk size so chunk_size * N_index * 2 bytes <= 3 GB (exactly like Channel A)
-                max_bytes = 3 * 1024 * 1024 * 1024  # 3 GB
-                bytes_per_query = N_index * 2
-                max_q_chunk = max(1, max_bytes // max(1, bytes_per_query))
-                q_chunk_size = min(max_q_chunk, 5000)
-                if batch_size:
-                    q_chunk_size = min(q_chunk_size, batch_size)
-                score_mat_gb = (q_chunk_size * bytes_per_query) / (1024.0 ** 3)
-                print(f"    [{ctry} - {target_idx.source_name}] Index rows: {N_index:,} | "
-                      f"Query chunk size: {q_chunk_size} (score matrix {score_mat_gb:.2f} GB <= 3.00 GB)", flush=True)
-
-                # Process S1 queries in batches
-                for b_start in range(0, len(s1_ids_c), q_chunk_size):
-                    b_end = min(b_start + q_chunk_size, len(s1_ids_c))
-                    sub_sids = s1_ids_c[b_start:b_end]
-
-                    # Query embeddings
-                    sub_m_idx = [s1_m_map[sid] for sid in sub_sids if sid in s1_m_map]
-                    if len(sub_m_idx) != len(sub_sids):
+            for ctry, s1_ids_c in s1_by_country.items():
+                for target_idx, is_s2 in [(idx_s2, True), (idx_s3, False)]:
+                    cand_pool_indices = target_idx.cand_indices_by_country.get(ctry, [])
+                    if not cand_pool_indices or not s1_ids_c:
                         continue
-                    Q_m = torch.from_numpy(s1_m_emb[sub_m_idx]).to(device)
-                    S = Q_m @ X_gpu.T
 
-                    has_alt_mask = np.array([sid in s1_a_map for sid in sub_sids])
-                    if has_alt_mask.any():
-                        sub_alt_sids = [sid for sid in sub_sids if sid in s1_a_map]
-                        sub_alt_idx = [s1_a_map[sid] for sid in sub_alt_sids]
-                        Q_a = torch.from_numpy(s1_a_emb[sub_alt_idx]).to(device)
-                        S_a = Q_a @ X_gpu.T
-                        S[has_alt_mask] = torch.maximum(S[has_alt_mask], S_a)
+                    cand_ids_pool = target_idx.entity_ids_int[cand_pool_indices]
 
-                    # Top 400 embedding scores
-                    top_scores, top_indices = torch.topk(S, k=k_search, dim=1)
-                    top_scores = top_scores.float().cpu().numpy()
-                    top_indices = top_indices.cpu().numpy()
-                    del S
+                    # Stack target embeddings (main + alt)
+                    c_m_indices = [target_idx.main_map[cid] for cid in cand_ids_pool if cid in target_idx.main_map]
+                    X_main = target_idx.main_emb[c_m_indices]
+                    X_main_cids = cand_ids_pool[[cid in target_idx.main_map for cid in cand_ids_pool]]
 
-                    # Deduplicate candidates to 200 unique
-                    B_curr = len(sub_sids)
-                    top200_cand_ids: list[list[str]] = []
-                    top200_cand_scores: list[list[float]] = []
-                    top200_pool_indices: list[list[int]] = []
+                    c_a_cids = [cid for cid in cand_ids_pool if cid in target_idx.alt_map]
+                    if c_a_cids:
+                        c_a_indices = [target_idx.alt_map[cid] for cid in c_a_cids]
+                        X_alt = target_idx.alt_emb[c_a_indices]
+                        X_alt_cids = np.array(c_a_cids, dtype=np.int64)
+                        X_stacked = np.vstack([X_main, X_alt])
+                        row_to_cid = np.concatenate([X_main_cids, X_alt_cids])
+                    else:
+                        X_stacked = X_main
+                        row_to_cid = X_main_cids
 
-                    for b in range(B_curr):
-                        b_cids = row_to_cid[top_indices[b]]
-                        b_scs = top_scores[b]
-                        seen_c: dict[str, float] = {}
-                        for cid, sc in zip(b_cids, b_scs):
-                            if cid not in seen_c or sc > seen_c[cid]:
-                                seen_c[cid] = float(sc)
-                                if len(seen_c) >= 200:
+                    N_index = len(X_stacked)
+                    if N_index == 0:
+                        continue
+
+                    X_gpu = torch.from_numpy(X_stacked).to(device)
+                    k_search = min(400, N_index)
+
+                    # Build IDF weights for this country over vocabulary
+                    max_docs_ctry = max(1, len(cand_pool_indices))
+
+                    # Token arrays for S1 queries in this country
+                    s1_token_matrix = np.zeros((len(s1_ids_c), 24), dtype=np.int32)
+                    s1_weights_matrix = np.zeros((len(s1_ids_c), 24), dtype=np.float32)
+
+                    for q_i, sid_int in enumerate(s1_ids_c):
+                        meta = s1_meta_by_int.get(sid_int)
+                        ad_s1 = meta[2] if meta else ""
+                        toks_s1 = tokenize_address_f(str(ad_s1))[:24]
+                        for t_pos, t_str in enumerate(toks_s1):
+                            if t_str not in global_tok_to_id:
+                                tid = len(global_id_to_tok)
+                                global_tok_to_id[t_str] = tid
+                                global_id_to_tok.append(t_str)
+                            t_id = global_tok_to_id[t_str]
+                            df_val = doc_freqs.get((ctry, t_str), 0)
+                            idf_val = float(np.log(1.0 + (max_docs_ctry + 1.0) / (df_val + 1.0)))
+                            s1_token_matrix[q_i, t_pos] = t_id
+                            s1_weights_matrix[q_i, t_pos] = idf_val
+
+                    # Slice candidate token matrix directly
+                    cand_token_matrix = target_idx.cand_token_matrix[cand_pool_indices]
+                    cand_id_to_pool_idx = {int(cid): idx for idx, cid in enumerate(cand_ids_pool)}
+
+                    # Calculate query chunk size (score matrix <= 3 GB)
+                    max_bytes = 3 * 1024 * 1024 * 1024  # 3 GB
+                    bytes_per_query = N_index * 2
+                    max_q_chunk = max(1, max_bytes // max(1, bytes_per_query))
+                    q_chunk_size = min(max_q_chunk, 5000)
+                    if batch_size:
+                        q_chunk_size = min(q_chunk_size, batch_size)
+
+                    # Process S1 queries in batches
+                    for b_start in range(0, len(s1_ids_c), q_chunk_size):
+                        b_end = min(b_start + q_chunk_size, len(s1_ids_c))
+                        sub_sids = s1_ids_c[b_start:b_end]
+
+                        # Query embeddings
+                        sub_m_idx = [s1_m_map[sid] for sid in sub_sids if sid in s1_m_map]
+                        if len(sub_m_idx) != len(sub_sids):
+                            continue
+                        Q_m = torch.from_numpy(s1_m_emb[sub_m_idx]).to(device)
+                        S = Q_m @ X_gpu.T
+
+                        has_alt_mask = np.array([sid in s1_a_map for sid in sub_sids])
+                        if has_alt_mask.any():
+                            sub_alt_sids = [sid for sid in sub_sids if sid in s1_a_map]
+                            sub_alt_idx = [s1_a_map[sid] for sid in sub_alt_sids]
+                            Q_a = torch.from_numpy(s1_a_emb[sub_alt_idx]).to(device)
+                            S_a = Q_a @ X_gpu.T
+                            S[has_alt_mask] = torch.maximum(S[has_alt_mask], S_a)
+                            del Q_a, S_a
+
+                        # Top 200 embedding scores
+                        top_scores, top_indices = torch.topk(S, k=k_search, dim=1)
+                        top_scores = top_scores.float().cpu().numpy()
+                        top_indices = top_indices.cpu().numpy()
+                        del S, Q_m
+
+                        # Deduplicate candidates to 200 unique
+                        B_curr = len(sub_sids)
+                        top200_cand_ids: list[list[int]] = []
+                        top200_cand_scores: list[list[float]] = []
+                        top200_pool_indices: list[list[int]] = []
+
+                        for b in range(B_curr):
+                            b_cids = row_to_cid[top_indices[b]]
+                            b_scs = top_scores[b]
+                            seen_c: dict[int, float] = {}
+                            for cid, sc in zip(b_cids, b_scs):
+                                cid_val = int(cid)
+                                if cid_val not in seen_c or sc > seen_c[cid_val]:
+                                    seen_c[cid_val] = float(sc)
+                                    if len(seen_c) >= 200:
+                                        break
+                            c_list = list(seen_c.keys())
+                            top200_cand_ids.append(c_list)
+                            top200_cand_scores.append(list(seen_c.values()))
+                            top200_pool_indices.append([cand_id_to_pool_idx[c] for c in c_list])
+
+                        # GPU address re-rank
+                        max_c_len = max(len(cl) for cl in top200_cand_ids) if top200_cand_ids else 0
+                        if max_c_len == 0:
+                            continue
+
+                        T_cand_sub = np.zeros((B_curr, max_c_len, 24), dtype=np.int32)
+                        for b in range(B_curr):
+                            for j, p_idx in enumerate(top200_pool_indices[b]):
+                                T_cand_sub[b, j] = cand_token_matrix[p_idx]
+
+                        T_cand_gpu = torch.from_numpy(T_cand_sub).to(device)
+                        T_s1_gpu = torch.from_numpy(s1_token_matrix[b_start:b_end]).to(device)
+                        W_s1_gpu = torch.from_numpy(s1_weights_matrix[b_start:b_end]).to(device)
+
+                        has_tok = (T_s1_gpu.unsqueeze(1).unsqueeze(-1) == T_cand_gpu.unsqueeze(2)).any(dim=-1)
+                        has_tok = has_tok & (T_s1_gpu.unsqueeze(1) != 0)
+                        rerank_scores = (has_tok.float() * W_s1_gpu.unsqueeze(1)).sum(dim=-1).cpu().numpy()
+
+                        del T_cand_gpu, T_s1_gpu, W_s1_gpu, has_tok, T_cand_sub
+
+                        # Select top 10 per S1 not already in candidates
+                        for b, sid in enumerate(sub_sids):
+                            cids_b = top200_cand_ids[b]
+                            emb_scs_b = top200_cand_scores[b]
+                            rr_scs_b = rerank_scores[b]
+                            existing_set = existing_cands_map[sid]
+
+                            ranked_order = sorted(
+                                range(len(cids_b)),
+                                key=lambda j: (rr_scs_b[j], emb_scs_b[j]),
+                                reverse=True,
+                            )
+
+                            kept_count = 0
+                            for j in ranked_order:
+                                cid = cids_b[j]
+                                if cid in existing_set:
+                                    continue
+
+                                c_dict = augmented_candidates[sid].setdefault(cid, {
+                                    "ch_rerank": 0, "ch_k1": 0, "ch_k3": 0, "ch_k5": 0, "ch_comb": 0,
+                                    "f_score": 0.0, "emb_score": emb_scs_b[j], "is_s2": is_s2,
+                                })
+                                c_dict["ch_rerank"] = 1
+                                c_dict["f_score"] = max(c_dict["f_score"], float(rr_scs_b[j]))
+                                c_dict["emb_score"] = max(c_dict["emb_score"], float(emb_scs_b[j]))
+
+                                kept_count += 1
+                                if kept_count >= 10:
                                     break
-                        c_list = list(seen_c.keys())
-                        top200_cand_ids.append(c_list)
-                        top200_cand_scores.append(list(seen_c.values()))
-                        top200_pool_indices.append([cand_id_to_pool_idx[c] for c in c_list])
 
-                    # Prepare batch tensor for GPU address re-rank
-                    max_c_len = max(len(cl) for cl in top200_cand_ids) if top200_cand_ids else 0
-                    if max_c_len == 0:
-                        continue
+                        del top200_cand_ids, top200_cand_scores, top200_pool_indices, rerank_scores
 
-                    T_cand_sub = np.zeros((B_curr, max_c_len, 24), dtype=np.int32)
-                    for b in range(B_curr):
-                        for j, p_idx in enumerate(top200_pool_indices[b]):
-                            T_cand_sub[b, j] = cand_token_matrix[p_idx]
+                    del X_gpu, cand_token_matrix, s1_token_matrix, s1_weights_matrix
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    elif torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
 
-                    # GPU Re-rank
-                    T_cand_gpu = torch.from_numpy(T_cand_sub).to(device)
-                    T_s1_gpu = torch.from_numpy(s1_token_matrix[b_start:b_end]).to(device)
-                    W_s1_gpu = torch.from_numpy(s1_weights_matrix[b_start:b_end]).to(device)
-
-                    # (B, 1, L_s1, 1) == (B, 200, 1, L_cand) -> any over dim=-1
-                    has_tok = (T_s1_gpu.unsqueeze(1).unsqueeze(-1) == T_cand_gpu.unsqueeze(2)).any(dim=-1)
-                    has_tok = has_tok & (T_s1_gpu.unsqueeze(1) != 0)
-                    rerank_scores = (has_tok.float() * W_s1_gpu.unsqueeze(1)).sum(dim=-1).cpu().numpy()
-
-                    del T_cand_gpu, T_s1_gpu, W_s1_gpu, has_tok
-
-                    # Select top 10 per S1 not already in candidates
-                    for b, sid in enumerate(sub_sids):
-                        cids_b = top200_cand_ids[b]
-                        emb_scs_b = top200_cand_scores[b]
-                        rr_scs_b = rerank_scores[b]
-                        
-                        existing_set = existing_cands_map[sid]
-
-                        # Sort by (rerank_score, emb_score) descending
-                        ranked_order = sorted(
-                            range(len(cids_b)),
-                            key=lambda j: (rr_scs_b[j], emb_scs_b[j]),
-                            reverse=True,
-                        )
-
-                        kept_count = 0
-                        for j in ranked_order:
-                            cid = cids_b[j]
-                            if cid in existing_set:
-                                continue
-                            
-                            c_dict = augmented_candidates[sid].setdefault(cid, {
-                                "ch_rerank": 0, "ch_k1": 0, "ch_k3": 0, "ch_k5": 0,
-                                "f_score": 0.0, "emb_score": emb_scs_b[j], "is_s2": is_s2,
-                            })
-                            c_dict["ch_rerank"] = 1
-                            c_dict["f_score"] = max(c_dict["f_score"], float(rr_scs_b[j]))
-                            c_dict["emb_score"] = max(c_dict["emb_score"], float(emb_scs_b[j]))
-
-                            kept_count += 1
-                            if kept_count >= 10:
-                                break
-
-                del X_gpu, cand_token_matrix, idf_weights_tensor
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                elif torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
-
-        print(f"  Channel F completed in {time.time() - t_f0:.1f}s | RSS: {_rss_mb():.1f} MB", flush=True)
+            print(f"  Channel F completed in {time.time() - t_f0:.1f}s | RSS: {_rss_mb():.1f} MB", flush=True)
 
         # ----------------------------------------------------------------------
         # CHANNEL G: Address Keys K5, K3, K1
         # ----------------------------------------------------------------------
-        print(f"  Running Channel G (Address Keys K5, K3, K1)...", flush=True)
-        t_g0 = time.time()
-        for sid in chunk_s1_ids:
-            r_s1 = s1_norm_map.get(sid)
-            if not r_s1:
-                continue
-            c = str(r_s1.get("country", "")).strip()
-            num_str = str(r_s1.get("num_tokens", "")).strip()
-            addr_str = str(r_s1.get("addr_norm", "")).strip()
-            existing_set = existing_cands_map[sid]
+        if run_fg:
+            print(f"  Running Channel G (Address Keys K5, K3, K1)...", flush=True)
+            t_g0 = time.time()
+            for sid in chunk_s1_ints_unique:
+                meta = s1_meta_by_int.get(int(sid))
+                if not meta:
+                    continue
+                c = str(meta[0]).strip()
+                num_str = str(meta[1]).strip()
+                addr_str = str(meta[2]).strip()
+                existing_set = existing_cands_map[int(sid)]
 
-            for target_idx, is_s2 in [(idx_s2, True), (idx_s3, False)]:
-                # Key K5
-                k5_keys = extract_k5(c, num_str, addr_str, doc_freqs)
-                cands_k5: set[str] = set()
-                for k in k5_keys:
-                    cands_k5.update(target_idx.k5_index.get(k, []))
-                cands_k5.difference_update(existing_set)
-                if cands_k5:
-                    scored_k5 = [(cid, _calc_emb_score(sid, cid, is_s2)) for cid in cands_k5]
-                    scored_k5.sort(key=lambda x: x[1], reverse=True)
-                    for cid, sc in scored_k5[:10]:
-                        c_dict = augmented_candidates[sid].setdefault(cid, {
-                            "ch_rerank": 0, "ch_k1": 0, "ch_k3": 0, "ch_k5": 0,
-                            "f_score": 0.0, "emb_score": sc, "is_s2": is_s2,
-                        })
-                        c_dict["ch_k5"] = 1
-                        c_dict["emb_score"] = max(c_dict["emb_score"], sc)
+                for target_idx, is_s2 in [(idx_s2, True), (idx_s3, False)]:
+                    # Key K5
+                    k5_keys = extract_k5(c, num_str, addr_str, doc_freqs)
+                    cands_k5: set[int] = set()
+                    for k in k5_keys:
+                        if k in target_idx.k5_index:
+                            cands_k5.update(target_idx.k5_index[k])
+                    cands_k5.difference_update(existing_set)
+                    if cands_k5:
+                        scored_k5 = [(cid, _calc_emb_score(sid, cid, is_s2)) for cid in cands_k5]
+                        scored_k5.sort(key=lambda x: x[1], reverse=True)
+                        for cid, sc in scored_k5[:10]:
+                            c_dict = augmented_candidates[sid].setdefault(cid, {
+                                "ch_rerank": 0, "ch_k1": 0, "ch_k3": 0, "ch_k5": 0, "ch_comb": 0,
+                                "f_score": 0.0, "emb_score": sc, "is_s2": is_s2,
+                            })
+                            c_dict["ch_k5"] = 1
+                            c_dict["emb_score"] = max(c_dict["emb_score"], sc)
 
-                # Key K3
-                k3_keys = extract_k3(c, num_str)
-                cands_k3: set[str] = set()
-                for k in k3_keys:
-                    cands_k3.update(target_idx.k3_index.get(k, []))
-                cands_k3.difference_update(existing_set)
-                if cands_k3:
-                    scored_k3 = [(cid, _calc_emb_score(sid, cid, is_s2)) for cid in cands_k3]
-                    scored_k3.sort(key=lambda x: x[1], reverse=True)
-                    for cid, sc in scored_k3[:10]:
-                        c_dict = augmented_candidates[sid].setdefault(cid, {
-                            "ch_rerank": 0, "ch_k1": 0, "ch_k3": 0, "ch_k5": 0,
-                            "f_score": 0.0, "emb_score": sc, "is_s2": is_s2,
-                        })
-                        c_dict["ch_k3"] = 1
-                        c_dict["emb_score"] = max(c_dict["emb_score"], sc)
+                    # Key K3
+                    k3_keys = extract_k3(c, num_str)
+                    cands_k3: set[int] = set()
+                    for k in k3_keys:
+                        if k in target_idx.k3_index:
+                            cands_k3.update(target_idx.k3_index[k])
+                    cands_k3.difference_update(existing_set)
+                    if cands_k3:
+                        scored_k3 = [(cid, _calc_emb_score(sid, cid, is_s2)) for cid in cands_k3]
+                        scored_k3.sort(key=lambda x: x[1], reverse=True)
+                        for cid, sc in scored_k3[:10]:
+                            c_dict = augmented_candidates[sid].setdefault(cid, {
+                                "ch_rerank": 0, "ch_k1": 0, "ch_k3": 0, "ch_k5": 0, "ch_comb": 0,
+                                "f_score": 0.0, "emb_score": sc, "is_s2": is_s2,
+                            })
+                            c_dict["ch_k3"] = 1
+                            c_dict["emb_score"] = max(c_dict["emb_score"], sc)
 
-                # Key K1
-                k1_keys = extract_k1(c, num_str)
-                cands_k1: set[str] = set()
-                for k in k1_keys:
-                    cands_k1.update(target_idx.k1_index.get(k, []))
-                cands_k1.difference_update(existing_set)
-                if cands_k1:
-                    scored_k1 = [(cid, _calc_emb_score(sid, cid, is_s2)) for cid in cands_k1]
-                    scored_k1.sort(key=lambda x: x[1], reverse=True)
-                    for cid, sc in scored_k1[:10]:
-                        c_dict = augmented_candidates[sid].setdefault(cid, {
-                            "ch_rerank": 0, "ch_k1": 0, "ch_k3": 0, "ch_k5": 0,
-                            "f_score": 0.0, "emb_score": sc, "is_s2": is_s2,
-                        })
-                        c_dict["ch_k1"] = 1
-                        c_dict["emb_score"] = max(c_dict["emb_score"], sc)
+                    # Key K1
+                    k1_keys = extract_k1(c, num_str)
+                    cands_k1: set[int] = set()
+                    for k in k1_keys:
+                        if k in target_idx.k1_index:
+                            cands_k1.update(target_idx.k1_index[k])
+                    cands_k1.difference_update(existing_set)
+                    if cands_k1:
+                        scored_k1 = [(cid, _calc_emb_score(sid, cid, is_s2)) for cid in cands_k1]
+                        scored_k1.sort(key=lambda x: x[1], reverse=True)
+                        for cid, sc in scored_k1[:10]:
+                            c_dict = augmented_candidates[sid].setdefault(cid, {
+                                "ch_rerank": 0, "ch_k1": 0, "ch_k3": 0, "ch_k5": 0, "ch_comb": 0,
+                                "f_score": 0.0, "emb_score": sc, "is_s2": is_s2,
+                            })
+                            c_dict["ch_k1"] = 1
+                            c_dict["emb_score"] = max(c_dict["emb_score"], sc)
 
-        print(f"  Channel G completed in {time.time() - t_g0:.1f}s | RSS: {_rss_mb():.1f} MB", flush=True)
+            print(f"  Channel G completed in {time.time() - t_g0:.1f}s | RSS: {_rss_mb():.1f} MB", flush=True)
 
         # ----------------------------------------------------------------------
-        # MERGE & ATOM-WRITE CHUNK
+        # CHANNEL H: Combined Name + Address Embeddings (GPU Top-20)
         # ----------------------------------------------------------------------
-        print(f"  Merging new candidates (max 20 per S1)...", flush=True)
+        if run_h:
+            print(f"  Running Channel H (Combined Embeddings GPU Top-20)...", flush=True)
+            t_h0 = time.time()
+            for target_idx, is_s2, comb_emb, comb_map, active in [
+                (idx_s2, True, s2_comb_emb, s2_comb_map, channel_h_active_s2),
+                (idx_s3, False, s3_comb_emb, s3_comb_map, channel_h_active_s3),
+            ]:
+                if not active or comb_emb is None:
+                    continue
+
+                for ctry, s1_ids_c in s1_by_country.items():
+                    cand_pool_indices = target_idx.cand_indices_by_country.get(ctry, [])
+                    if not cand_pool_indices or not s1_ids_c:
+                        continue
+
+                    # Target candidate pool in this country that have combined embeddings
+                    cand_ids_pool = target_idx.entity_ids_int[cand_pool_indices]
+                    valid_c_mask = [cid in comb_map for cid in cand_ids_pool]
+                    valid_cids = cand_ids_pool[valid_c_mask]
+                    if len(valid_cids) == 0:
+                        continue
+
+                    target_emb_indices = [comb_map[cid] for cid in valid_cids]
+                    X_comb = comb_emb[target_emb_indices]
+                    N_comb = len(X_comb)
+
+                    # S1 queries that have combined embeddings
+                    valid_s1 = [sid for sid in s1_ids_c if sid in s1_comb_map]
+                    if not valid_s1:
+                        continue
+
+                    X_comb_gpu = torch.from_numpy(X_comb).to(device)
+                    k_search = min(20, N_comb)
+
+                    max_bytes = 3 * 1024 * 1024 * 1024
+                    bytes_per_query = N_comb * 2
+                    max_q_chunk = max(1, max_bytes // max(1, bytes_per_query))
+                    q_chunk_size = min(max_q_chunk, 5000)
+                    if batch_size:
+                        q_chunk_size = min(q_chunk_size, batch_size)
+
+                    for b_start in range(0, len(valid_s1), q_chunk_size):
+                        b_end = min(b_start + q_chunk_size, len(valid_s1))
+                        sub_sids = valid_s1[b_start:b_end]
+
+                        sub_s1_indices = [s1_comb_map[sid] for sid in sub_sids]
+                        Q_comb = torch.from_numpy(s1_comb_emb[sub_s1_indices]).to(device)
+
+                        S_comb = Q_comb @ X_comb_gpu.T
+                        top_scs, top_idxs = torch.topk(S_comb, k=k_search, dim=1)
+                        top_scs = top_scs.float().cpu().numpy()
+                        top_idxs = top_idxs.cpu().numpy()
+                        del S_comb, Q_comb
+
+                        for b, sid in enumerate(sub_sids):
+                            c_indices = top_idxs[b]
+                            existing_set = existing_cands_map[sid]
+                            for c_idx in c_indices:
+                                cid = int(valid_cids[c_idx])
+                                if cid in existing_set:
+                                    continue
+                                sc_emb = _calc_emb_score(sid, cid, is_s2)
+                                c_dict = augmented_candidates[sid].setdefault(cid, {
+                                    "ch_rerank": 0, "ch_k1": 0, "ch_k3": 0, "ch_k5": 0, "ch_comb": 0,
+                                    "f_score": 0.0, "emb_score": sc_emb, "is_s2": is_s2,
+                                })
+                                c_dict["ch_comb"] = 1
+                                c_dict["emb_score"] = max(c_dict["emb_score"], sc_emb)
+
+                    del X_comb_gpu
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    elif torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+
+            print(f"  Channel H completed in {time.time() - t_h0:.1f}s | RSS: {_rss_mb():.1f} MB", flush=True)
+
+        # ----------------------------------------------------------------------
+        # MERGE & ATOMIC WRITE CHUNK
+        # ----------------------------------------------------------------------
+        print(f"  Merging new candidates (cap {extra_cap} per S1)...", flush=True)
         new_rows: list[dict[str, Any]] = []
-        for sid in chunk_s1_ids:
+
+        for sid_int in chunk_s1_ints_unique:
+            sid = int(sid_int)
             cands_dict = augmented_candidates.get(sid, {})
             if not cands_dict:
                 continue
 
-            # Sort new candidates: (n_new_channels, f_score, emb_score) descending
+            # Remaining budget if chunk already had F/G extra rows
+            budget = max(0, extra_cap - existing_extra_count.get(sid, 0))
+            if budget <= 0:
+                continue
+
+            # Priority: number of new channels, then ch_comb, then f_score, then emb_score
             sorted_new_cands = sorted(
                 cands_dict.items(),
                 key=lambda item: (
-                    item[1]["ch_rerank"] + item[1]["ch_k1"] + item[1]["ch_k3"] + item[1]["ch_k5"],
+                    item[1]["ch_rerank"] + item[1]["ch_k1"] + item[1]["ch_k3"] + item[1]["ch_k5"] + item[1].get("ch_comb", 0),
+                    item[1].get("ch_comb", 0),
                     item[1]["f_score"],
                     item[1]["emb_score"],
                 ),
                 reverse=True,
             )
 
-            # Cap to at most 20 extra candidates per S1
-            for cid, info in sorted_new_cands[:20]:
+            s1_str = _int_to_id([sid])[0]
+            for cid, info in sorted_new_cands[:budget]:
                 is_s2 = info["is_s2"]
+                cid_str = _int_to_id([cid])[0]
                 row_dict: dict[str, Any] = {
-                    "s1_id": sid,
-                    "cand_id": cid,
+                    "s1_id": s1_str,
+                    "cand_id": cid_str,
                     "cand_source": 0 if is_s2 else 1,
                     "emb_score": np.float32(info["emb_score"]),
                     "emb_rank": np.float32(999.0),
@@ -726,19 +932,24 @@ def run_augmentation(
                     "ch_k3": np.int8(info["ch_k3"]),
                     "ch_k5": np.int8(info["ch_k5"]),
                 }
+                if channel_h_any_active:
+                    row_dict["ch_comb"] = np.int8(info.get("ch_comb", 0))
+
                 if split == "train":
-                    row_dict["label"] = np.int32(1 if (sid, cid) in gt_pairs else 0)
+                    row_dict["label"] = np.int32(1 if (sid, cid) in gt_pairs_int else 0)
                 new_rows.append(row_dict)
 
-        # Add 0 flags to existing rows
-        chunk_df["ch_rerank"] = np.int8(0)
-        chunk_df["ch_k1"] = np.int8(0)
-        chunk_df["ch_k3"] = np.int8(0)
-        chunk_df["ch_k5"] = np.int8(0)
+        # Update existing rows
+        if "ch_rerank" not in chunk_df.columns:
+            chunk_df["ch_rerank"] = np.int8(0)
+            chunk_df["ch_k1"] = np.int8(0)
+            chunk_df["ch_k3"] = np.int8(0)
+            chunk_df["ch_k5"] = np.int8(0)
+        if channel_h_any_active and "ch_comb" not in chunk_df.columns:
+            chunk_df["ch_comb"] = np.int8(0)
 
         if new_rows:
             new_df = pd.DataFrame(new_rows)
-            # Align column types with existing chunk_df
             for col in chunk_df.columns:
                 if col in new_df.columns:
                     new_df[col] = new_df[col].astype(chunk_df[col].dtype)
@@ -752,7 +963,7 @@ def run_augmentation(
         os.replace(tmp_out, chunk_path)
 
         added_cnt = len(new_rows)
-        avg_extra = added_cnt / max(1, len(chunk_s1_ids))
+        avg_extra = added_cnt / max(1, len(chunk_s1_ints_unique))
         t_ch_elapsed = time.time() - t_ch_start
         print(f"  Chunk {ch_idx + 1} Saved: {len(augmented_df):,} total rows "
               f"(+{added_cnt:,} new rows, avg +{avg_extra:.2f}/S1) in {t_ch_elapsed:.1f}s | "
@@ -761,11 +972,11 @@ def run_augmentation(
         del chunk_df, augmented_df, augmented_candidates, new_rows
         gc.collect()
 
-    print(f"\nAll chunk processing completed in {time.time() - total_start:.1f}s.")
+    print(f"\nAll chunk processing completed in {time.time() - total_start:.1f}s. Final RSS: {_rss_mb():.1f} MB")
 
     # 9. Validation Recall Report (train only)
-    if split == "train" and len(gt_pairs) > 0:
-        run_validation_report(cache_dir, chunk_files, s1_norm_map, gt_pairs)
+    if split == "train" and len(gt_pairs_int) > 0:
+        run_validation_report(cache_dir, chunk_files, s1_meta_by_int)
 
 
 # ==============================================================================
@@ -775,65 +986,79 @@ def run_augmentation(
 def run_validation_report(
     cache_dir: str,
     processed_chunk_files: list[str],
-    s1_norm_map: dict[str, dict[str, Any]],
-    gt_pairs: set[tuple[str, str]],
+    s1_meta_by_int: dict[int, tuple[Any, Any, Any]],
 ) -> None:
-    """Computes and displays pair recall, entity recall, and unique channel contributions on val S1."""
+    """Computes and displays pair recall and entity recall restricted to val S1 in processed chunks."""
     print("\n" + "=" * 90)
     print("                 VAL BLOCKING RECALL REPORT (BEFORE vs AFTER)")
     print("=" * 90)
 
-    # Load val S1 set
     split_path = os.path.join(cache_dir, "split.parquet")
     if not os.path.exists(split_path):
         print("split.parquet not found, skipping validation report.")
         return
-        
+
     split_df = pd.read_parquet(split_path)
-    val_s1_set = set(split_df[split_df["fold"] == "val"]["s1_id"]) if "fold" in split_df.columns else set(split_df["s1_id"])
-    print(f"Total Val S1 entities: {len(val_s1_set):,}")
-
-    # Load GT table for val
-    gt_path = os.path.join(cache_dir, "gt_long.parquet")
-    gt_df = pd.read_parquet(gt_path)
-    if "match_id" not in gt_df.columns and "cand_id" in gt_df.columns:
-        gt_df = gt_df.rename(columns={"cand_id": "match_id"})
-    gt_val = gt_df[gt_df["s1_id"].isin(val_s1_set)].copy()
-    if "match_source" not in gt_val.columns:
-        gt_val["match_source"] = ["S2" if str(m).startswith("S2") else "S3" for m in gt_val["match_id"]]
-        
-    gt_val["country"] = [str(s1_norm_map.get(sid, {}).get("country", "")).strip() for sid in gt_val["s1_id"]]
-
-    total_gt = len(gt_val)
-    print(f"Total Val GT pairs: {total_gt:,} across {gt_val['s1_id'].nunique():,} unique S1")
+    s1_col = "s1_id" if "s1_id" in split_df.columns else "entity_id"
+    val_s1_set = set(split_df[split_df["fold"] == "val"][s1_col].astype(str)) if "fold" in split_df.columns else set(split_df[s1_col].astype(str))
 
     # Read processed chunks, filter to val S1 rows
     before_cands: set[tuple[str, str]] = set()
     after_cands: set[tuple[str, str]] = set()
-    new_cands_flags: dict[tuple[str, str], dict[str, int]] = {}
+    val_s1_in_chunks: set[str] = set()
 
     for cf in processed_chunk_files:
-        df_c = pd.read_parquet(cf, columns=["s1_id", "cand_id", "ch_rerank", "ch_k1", "ch_k3", "ch_k5"])
+        cols_to_load = ["s1_id", "cand_id", "ch_rerank", "ch_k1", "ch_k3", "ch_k5"]
+        if "ch_comb" in pq.ParquetFile(cf).schema.names:
+            cols_to_load.append("ch_comb")
+        df_c = pd.read_parquet(cf, columns=cols_to_load)
         df_val = df_c[df_c["s1_id"].isin(val_s1_set)]
-        for s1, cid, rrk, k1, k3, k5 in zip(df_val["s1_id"], df_val["cand_id"], df_val["ch_rerank"], df_val["ch_k1"], df_val["ch_k3"], df_val["ch_k5"]):
+        val_s1_in_chunks.update(df_val["s1_id"].unique())
+
+        has_comb = "ch_comb" in df_val.columns
+        for row in df_val.itertuples(index=False):
+            s1 = getattr(row, "s1_id")
+            cid = getattr(row, "cand_id")
+            rrk = getattr(row, "ch_rerank")
+            k1 = getattr(row, "ch_k1")
+            k3 = getattr(row, "ch_k3")
+            k5 = getattr(row, "ch_k5")
+            cmb = getattr(row, "ch_comb") if has_comb else 0
             pair = (s1, cid)
             after_cands.add(pair)
-            if rrk == 0 and k1 == 0 and k3 == 0 and k5 == 0:
+            if rrk == 0 and k1 == 0 and k3 == 0 and k5 == 0 and cmb == 0:
                 before_cands.add(pair)
-            else:
-                new_cands_flags[pair] = {"ch_rerank": rrk, "ch_k1": k1, "ch_k3": k3, "ch_k5": k5}
 
-    # Helper for recall statistics
+    # Load GT table for val and filter to val S1 in the processed chunks
+    gt_path = os.path.join(cache_dir, "gt_long.parquet")
+    gt_df = pd.read_parquet(gt_path)
+    cand_col = "match_id" if "match_id" in gt_df.columns else "cand_id"
+    gt_df["s1_id"] = gt_df["s1_id"].astype(str)
+    gt_df[cand_col] = gt_df[cand_col].astype(str)
+
+    gt_val = gt_df[gt_df["s1_id"].isin(val_s1_in_chunks)].copy()
+    if "match_source" not in gt_val.columns:
+        gt_val["match_source"] = ["S2" if str(m).startswith("S2") else "S3" for m in gt_val[cand_col]]
+
+    s1_ctry_map = {sid: str(s1_meta_by_int.get(_id_to_int_single(sid), ("", "", ""))[0]).strip() for sid in val_s1_in_chunks}
+    gt_val["country"] = [s1_ctry_map.get(sid, "") for sid in gt_val["s1_id"]]
+
+    total_gt = len(gt_val)
+    print(f"Val S1 entities in processed chunks: {len(val_s1_in_chunks):,}")
+    print(f"Total Val GT pairs in scope: {total_gt:,} across {gt_val['s1_id'].nunique():,} unique S1")
+
+    if total_gt == 0:
+        print("No GT pairs in scope for processed chunks.")
+        return
+
     def _calc_stats(cands_set: set[tuple[str, str]]) -> dict[str, Any]:
-        found_mask = [pair in cands_set for pair in zip(gt_val["s1_id"], gt_val["match_id"])]
+        found_mask = [pair in cands_set for pair in zip(gt_val["s1_id"], gt_val[cand_col])]
         gt_found = gt_val[found_mask]
-        
-        # Overall
+
         total_p = total_gt
         found_p = len(gt_found)
         pct_p = (found_p / total_p * 100.0) if total_p > 0 else 0.0
 
-        # By Country
         in_tot = len(gt_val[gt_val["country"] == "India"])
         in_fnd = len(gt_found[gt_found["country"] == "India"])
         in_pct = (in_fnd / in_tot * 100.0) if in_tot > 0 else 0.0
@@ -842,7 +1067,6 @@ def run_validation_report(
         us_fnd = len(gt_found[gt_found["country"] == "US"])
         us_pct = (us_fnd / us_tot * 100.0) if us_tot > 0 else 0.0
 
-        # By Source
         s2_tot = len(gt_val[gt_val["match_source"] == "S2"])
         s2_fnd = len(gt_found[gt_found["match_source"] == "S2"])
         s2_pct = (s2_fnd / s2_tot * 100.0) if s2_tot > 0 else 0.0
@@ -851,17 +1075,16 @@ def run_validation_report(
         s3_fnd = len(gt_found[gt_found["match_source"] == "S3"])
         s3_pct = (s3_fnd / s3_tot * 100.0) if s3_tot > 0 else 0.0
 
-        # Entity-level (100% matches found)
-        gt_grouped = gt_val.groupby("s1_id")["match_id"].apply(set)
+        gt_grouped = gt_val.groupby("s1_id")[cand_col].apply(set)
         cands_by_s1: dict[str, set[str]] = defaultdict(set)
         for s1, cid in cands_set:
-            cands_by_s1[s1].add(cid)
-            
+            if s1 in val_s1_in_chunks:
+                cands_by_s1[s1].add(cid)
+
         full_entities = sum(gold_set.issubset(cands_by_s1[sid]) for sid, gold_set in gt_grouped.items())
         tot_entities = len(gt_grouped)
         ent_pct = (full_entities / tot_entities * 100.0) if tot_entities > 0 else 0.0
-
-        avg_cands_s1 = len(cands_set) / max(1, len(val_s1_set))
+        avg_cands_s1 = len(cands_set) / max(1, len(val_s1_in_chunks))
 
         return {
             "found_p": found_p, "pct_p": pct_p,
@@ -869,92 +1092,43 @@ def run_validation_report(
             "us_fnd": us_fnd, "us_tot": us_tot, "us_pct": us_pct,
             "s2_fnd": s2_fnd, "s2_tot": s2_tot, "s2_pct": s2_pct,
             "s3_fnd": s3_fnd, "s3_tot": s3_tot, "s3_pct": s3_pct,
-            "full_ent": full_entities, "tot_ent": tot_entities, "ent_pct": ent_pct,
-            "avg_cands": avg_cands_s1,
+            "full_entities": full_entities, "tot_entities": tot_entities, "ent_pct": ent_pct,
+            "avg_cands_s1": avg_cands_s1,
         }
 
     st_before = _calc_stats(before_cands)
     st_after = _calc_stats(after_cands)
 
-    header = f"{'Metric':<36} | {'Before Augment':<20} | {'After Augment':<20} | {'Delta':<10}"
-    print(header)
-    print("-" * len(header))
+    def _diff_str(after_val: float, before_val: float) -> str:
+        d = after_val - before_val
+        sign = "+" if d >= 0 else ""
+        return f"{sign}{d:.2f}%"
 
-    def _fmt_row(name: str, key_p: str, key_cnt: str, key_tot: Optional[str] = None) -> str:
-        pct_b, pct_a = st_before[key_p], st_after[key_p]
-        delta = pct_a - pct_b
-        if key_tot:
-            s_b = f"{pct_b:6.2f}% ({st_before[key_cnt]:,}/{st_before[key_tot]:,})"
-            s_a = f"{pct_a:6.2f}% ({st_after[key_cnt]:,}/{st_after[key_tot]:,})"
-        else:
-            s_b = f"{pct_b:6.2f}% ({st_before[key_cnt]:,})"
-            s_a = f"{pct_a:6.2f}% ({st_after[key_cnt]:,})"
-        s_d = f"+{delta:.2f}%" if delta >= 0 else f"{delta:.2f}%"
-        return f"{name:<36} | {s_b:<20} | {s_a:<20} | {s_d:<10}"
-
-    print(_fmt_row("Overall Pair Recall", "pct_p", "found_p", None))
-    print(_fmt_row("  - India Pair Recall", "in_pct", "in_fnd", "in_tot"))
-    print(_fmt_row("  - US Pair Recall", "us_pct", "us_fnd", "us_tot"))
-    print(_fmt_row("  - S2 Pair Recall", "s2_pct", "s2_fnd", "s2_tot"))
-    print(_fmt_row("  - S3 Pair Recall", "s3_pct", "s3_fnd", "s3_tot"))
-    print(_fmt_row("Entity-Level Recall (100% matches)", "ent_pct", "full_ent", "tot_ent"))
-    
-    avg_b = st_before["avg_cands"]
-    avg_a = st_after["avg_cands"]
-    d_avg = avg_a - avg_b
-    print(f"{'Average Candidates per S1':<36} | {avg_b:<20.2f} | {avg_a:<20.2f} | +{d_avg:.2f}")
-
-    # Unique contributions among newly recovered GT pairs
-    newly_recovered = [pair for pair in zip(gt_val["s1_id"], gt_val["match_id"]) if (pair in after_cands and pair not in before_cands)]
-    print("\n" + "-" * len(header))
-    print(f"Unique Channel Contributions on {len(newly_recovered):,} Newly Recovered GT Pairs:")
-
-    only_rr = 0
-    only_k1 = 0
-    only_k3 = 0
-    only_k5 = 0
-    shared_new = 0
-
-    for pair in newly_recovered:
-        flags = new_cands_flags.get(pair, {"ch_rerank": 0, "ch_k1": 0, "ch_k3": 0, "ch_k5": 0})
-        rr = flags["ch_rerank"]
-        k1 = flags["ch_k1"]
-        k3 = flags["ch_k3"]
-        k5 = flags["ch_k5"]
-        n_ch = rr + k1 + k3 + k5
-        if n_ch > 1:
-            shared_new += 1
-        elif rr == 1:
-            only_rr += 1
-        elif k1 == 1:
-            only_k1 += 1
-        elif k3 == 1:
-            only_k3 += 1
-        elif k5 == 1:
-            only_k5 += 1
-
-    tot_rec = max(1, len(newly_recovered))
-    print(f"  - Channel F (Address Re-rank):       {only_rr:5,} ({only_rr/tot_rec*100:6.2f}%)")
-    print(f"  - Channel G (Key K1):                {only_k1:5,} ({only_k1/tot_rec*100:6.2f}%)")
-    print(f"  - Channel G (Key K3):                {only_k3:5,} ({only_k3/tot_rec*100:6.2f}%)")
-    print(f"  - Channel G (Key K5):                {only_k5:5,} ({only_k5/tot_rec*100:6.2f}%)")
-    print(f"  - Shared across new channels:        {shared_new:5,} ({shared_new/tot_rec*100:6.2f}%)")
-    print("=" * 90)
+    print("-" * 90)
+    print(f"{'Metric':<32} | {'Before (S3)':<18} | {'After (S3b)':<18} | {'Delta':<12}")
+    print("-" * 90)
+    print(f"{'Val Pair Recall (Overall)':<32} | {st_before['pct_p']:>6.2f}% ({st_before['found_p']:,}/{total_gt:,}) | {st_after['pct_p']:>6.2f}% ({st_after['found_p']:,}/{total_gt:,}) | {_diff_str(st_after['pct_p'], st_before['pct_p']):>10}")
+    print(f"{'  India Pair Recall':<32} | {st_before['in_pct']:>6.2f}% ({st_before['in_fnd']:,}/{st_before['in_tot']:,}) | {st_after['in_pct']:>6.2f}% ({st_after['in_fnd']:,}/{st_after['in_tot']:,}) | {_diff_str(st_after['in_pct'], st_before['in_pct']):>10}")
+    print(f"{'  US Pair Recall':<32} | {st_before['us_pct']:>6.2f}% ({st_before['us_fnd']:,}/{st_before['us_tot']:,}) | {st_after['us_pct']:>6.2f}% ({st_after['us_fnd']:,}/{st_after['us_tot']:,}) | {_diff_str(st_after['us_pct'], st_before['us_pct']):>10}")
+    print(f"{'  Source 2 Pair Recall':<32} | {st_before['s2_pct']:>6.2f}% ({st_before['s2_fnd']:,}/{st_before['s2_tot']:,}) | {st_after['s2_pct']:>6.2f}% ({st_after['s2_fnd']:,}/{st_after['s2_tot']:,}) | {_diff_str(st_after['s2_pct'], st_before['s2_pct']):>10}")
+    print(f"{'  Source 3 Pair Recall':<32} | {st_before['s3_pct']:>6.2f}% ({st_before['s3_fnd']:,}/{st_before['s3_tot']:,}) | {st_after['s3_pct']:>6.2f}% ({st_after['s3_fnd']:,}/{st_after['s3_tot']:,}) | {_diff_str(st_after['s3_pct'], st_before['s3_pct']):>10}")
+    print(f"{'Val Entity Recall (100% matched)':<32} | {st_before['ent_pct']:>6.2f}% ({st_before['full_entities']:,}/{st_before['tot_entities']:,}) | {st_after['ent_pct']:>6.2f}% ({st_after['full_entities']:,}/{st_after['tot_entities']:,}) | {_diff_str(st_after['ent_pct'], st_before['ent_pct']):>10}")
+    print(f"{'Avg Candidates per S1':<32} | {st_before['avg_cands_s1']:>12.1f}       | {st_after['avg_cands_s1']:>12.1f}       | {st_after['avg_cands_s1'] - st_before['avg_cands_s1']:>+10.1f}")
+    print("=" * 90 + "\n")
 
 
-# ==============================================================================
-# MAIN ENTRYPOINT
-# ==============================================================================
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Stage 3b Candidate Augmentation.")
+    parser.add_argument("--split", type=str, default="train", choices=["train", "test"], help="Dataset split.")
+    parser.add_argument("--cache-dir", type=str, default=None, help="Cache directory.")
+    parser.add_argument("--laptop-test", action="store_true", help="Use cache/laptop_test.")
+    parser.add_argument("--max-chunks", type=int, default=None, help="Maximum number of chunks to process.")
+    parser.add_argument("--batch-size", type=int, default=5000, help="Batch size for GPU operations.")
+    return parser.parse_args()
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Stage 3b Candidate Augmentation")
-    parser.add_argument("--split", type=str, choices=["train", "test"], default="train", help="Dataset split")
-    parser.add_argument("--cache-dir", type=str, default=None, help="Cache directory")
-    parser.add_argument("--laptop-test", action="store_true", help="Use cache/laptop_test")
-    parser.add_argument("--max-chunks", type=int, default=None, help="Limit to N chunks (for timing test)")
-    parser.add_argument("--batch-size", type=int, default=5000, help="S1 query batch size for GPU re-rank")
-    args = parser.parse_args()
-
+    args = parse_args()
     root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     if args.cache_dir:
         cache_dir = args.cache_dir
@@ -963,13 +1137,8 @@ def main() -> None:
     else:
         cache_dir = os.path.join(root_dir, "cache")
 
-    print(f"=== Starting Stage 3b Augmentation ({args.split}) ===")
-    print(f"Cache Directory: {cache_dir}")
-
-    # Safety: backup verification
     chunk_files = verify_backup_safety(cache_dir, args.split)
 
-    # Run augmentation
     run_augmentation(
         cache_dir=cache_dir,
         split=args.split,
