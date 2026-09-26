@@ -507,7 +507,12 @@ def run_augmentation(
             print("  Chunk already contains 'ch_rerank' and 'ch_comb', skipping (idempotent).")
             continue
 
-        # Case 2: Chunk has ch_rerank but NOT ch_comb (Channel H only)
+        # Case 2a: Chunk has ch_rerank but Channel H is not active (no embc files exist) -> skip without changes
+        if has_rerank and not channel_h_any_active:
+            print("  Chunk already contains 'ch_rerank' and no Channel H combined embeddings exist, skipping without changes.")
+            continue
+
+        # Case 2b: Chunk has ch_rerank but NOT ch_comb (Channel H only)
         # Case 3: Fresh chunk without ch_rerank (Run F, G, and if active H)
         run_fg = not has_rerank
         run_h = channel_h_any_active and (not has_comb)
