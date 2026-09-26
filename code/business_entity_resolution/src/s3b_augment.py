@@ -453,7 +453,7 @@ def run_augmentation(
                     continue
 
                 X_gpu = torch.from_numpy(X_stacked).to(device)
-                k_search = min(400, N_index)
+                k_search = min(200, N_index)
 
                 # Token vocabulary & IDF for this country
                 max_docs_ctry = max(1, len(cand_pool_indices))
@@ -498,9 +498,20 @@ def run_augmentation(
                 if len(idf_weights_list) > len(idf_weights_tensor):
                     idf_weights_tensor = torch.tensor(idf_weights_list, dtype=torch.float32, device=device)
 
+                # Calculate query chunk size so chunk_size * N_index * 2 bytes <= 3 GB (exactly like Channel A)
+                max_bytes = 3 * 1024 * 1024 * 1024  # 3 GB
+                bytes_per_query = N_index * 2
+                max_q_chunk = max(1, max_bytes // max(1, bytes_per_query))
+                q_chunk_size = min(max_q_chunk, 5000)
+                if batch_size:
+                    q_chunk_size = min(q_chunk_size, batch_size)
+                score_mat_gb = (q_chunk_size * bytes_per_query) / (1024.0 ** 3)
+                print(f"    [{ctry} - {target_idx.source_name}] Index rows: {N_index:,} | "
+                      f"Query chunk size: {q_chunk_size} (score matrix {score_mat_gb:.2f} GB <= 3.00 GB)", flush=True)
+
                 # Process S1 queries in batches
-                for b_start in range(0, len(s1_ids_c), batch_size):
-                    b_end = min(b_start + batch_size, len(s1_ids_c))
+                for b_start in range(0, len(s1_ids_c), q_chunk_size):
+                    b_end = min(b_start + q_chunk_size, len(s1_ids_c))
                     sub_sids = s1_ids_c[b_start:b_end]
 
                     # Query embeddings
